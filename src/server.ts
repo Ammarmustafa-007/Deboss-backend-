@@ -72,7 +72,7 @@ const handoffSchema = z.object({ operations_department_id: z.string().uuid(), re
 const shipmentUpdateSchema = z.object({ assigned_to: z.string().uuid().nullable().optional(), team_id: z.string().uuid().nullable().optional(), status: z.enum(["QUOTED", "BOOKED", "CARRIER_ASSIGNED", "PICKED_UP", "IN_TRANSIT", "DELIVERED", "PAID", "COMPLETED", "EXCEPTION"]).optional(), carrier_name: z.string().trim().max(160).nullable().optional(), exception_note: z.string().trim().max(3000).nullable().optional(), exception_owner_id: z.string().uuid().nullable().optional(), exception_resolution: z.string().trim().max(3000).nullable().optional(), invoice_ready: z.boolean().optional(), amount_quoted: z.number().nonnegative().nullable().optional(), amount_invoiced: z.number().nonnegative().nullable().optional(), amount_paid: z.number().nonnegative().nullable().optional(), payment_status: z.enum(["DRAFT", "SENT", "PENDING", "PAID", "OVERDUE", "CANCELLED"]).optional(), pickup_date: z.string().date().nullable().optional(), delivery_date: z.string().date().nullable().optional(), note: z.string().trim().max(3000).optional() });
 const salesShipmentStage = z.enum(["QUOTED", "BOOKED", "DELIVERED", "PAID"]);
 const customerUpdateSchema = z.object({ company_name: z.string().trim().min(2).max(180).optional(), contact_name: z.string().trim().max(160).nullable().optional(), contact_email: z.string().email().nullable().optional().or(z.literal("")), contact_phone: z.string().trim().max(80).nullable().optional() }).strict();
-const salesShipmentSchema = z.object({ reference_number: z.string().trim().min(3).max(64), pickup_location: z.string().trim().min(2).max(180), delivery_location: z.string().trim().min(2).max(180), equipment_type: z.string().trim().max(120).nullable().optional(), quoted_rate: z.number().nonnegative().nullable().optional(), pickup_date: z.string().date().nullable().optional(), delivery_date: z.string().date().nullable().optional(), status: salesShipmentStage.default("QUOTED") });
+const salesShipmentSchema = z.object({ reference_number: z.string().trim().min(3).max(64), pickup_location: z.string().trim().min(2).max(180), delivery_location: z.string().trim().min(2).max(180), equipment_type: z.string().trim().max(120).nullable().optional(), quoted_rate: z.number().nonnegative().nullable().optional(), agreed_rate: z.number().nonnegative().nullable().optional(), pickup_date: z.string().date().nullable().optional(), delivery_date: z.string().date().nullable().optional(), status: salesShipmentStage.default("QUOTED") });
 const salesShipmentUpdateSchema = salesShipmentSchema.partial();
 const documentSchema = z.object({ document_type: z.enum(["BOL", "POD", "RATE_CONFIRMATION", "INVOICE", "OTHER"]), storage_path: z.string().trim().min(2).max(500) });
 const documentReviewSchema = z.object({ is_verified: z.boolean(), review_note: z.string().trim().max(2000).nullable().optional() });
@@ -280,8 +280,19 @@ app.patch("/api/v1/brokerage/leads/:id", requireBrokerageUser, async (request: B
     if ((input.owner_id || input.team_id !== undefined) && !(isSuper(actor) || isManager(actor) || scope.permissions.has("sales.leads.assign"))) return response.status(403).json({ error: "Lead assignment permission is required." });
     if (input.owner_id && !await validDepartmentPeople(lead.department_id, [input.owner_id])) return response.status(422).json({ error: "The lead owner must be an active Sales Agent in this department." });
     if (input.team_id) { const { data: team } = await supabase.from("teams").select("id").eq("id", input.team_id).eq("department_id", lead.department_id).eq("is_active", true).maybeSingle(); if (!team) return response.status(422).json({ error: "The team must be active in this Sales department." }); }
-    const { data, error } = await supabase.from("sales_leads").update({ ...input, contact_email: input.contact_email || null }).eq("id", lead.id).select().single();
+    const leadUpdate = { ...input, contact_email: input.contact_email || null };
+    const { data, error } = await supabase.from("sales_leads").update(leadUpdate).eq("id", lead.id).select().single();
     if (error) throw error;
+    const customerFields = ["company_name", "contact_name", "contact_email", "contact_phone"].filter((field) => input[field as keyof typeof input] !== undefined);
+    if (customerFields.length) {
+      const { data: customer } = await supabase.from("brokerage_customers").select("id").eq("lead_id", lead.id).maybeSingle();
+      if (customer) {
+        const customerUpdate: Record<string, unknown> = {};
+        for (const field of customerFields) customerUpdate[field] = (leadUpdate as Record<string, unknown>)[field];
+        const { error: customerError } = await supabase.from("brokerage_customers").update(customerUpdate).eq("id", customer.id);
+        if (customerError) throw customerError;
+      }
+    }
     if (input.owner_id && input.owner_id !== lead.owner_id && input.owner_id !== actor.id) await supabase.from("notifications").insert({ recipient_id: input.owner_id, kind: "LEAD_ASSIGNED", title: "Lead assigned", body: `${lead.company_name} has been assigned to you.`, entity_type: "LEAD", entity_id: lead.id });
     await writeAudit(supabase, actor.id, "LEAD_UPDATED", "lead", lead.id, { fields: Object.keys(input) }); response.json({ lead: data });
   } catch (error) { next(error); }
@@ -388,7 +399,7 @@ app.get("/api/v1/brokerage/customers/:id/profile", requireBrokerageUser, async (
     const scope = await teamScope(actor); const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("id, owner_id, team_id, department_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
     const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id) || customer.owner_id === actor.id || (lead && !!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.view_team"));
     if (!allowed) return response.status(403).json({ error: "Customer is outside your work scope." });
-    const [activities, comments, quotes, shipments] = await Promise.all([customer.lead_id ? supabase.from("lead_activities").select("*").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("record_comments").select("*").eq("entity_type", "CUSTOMER").eq("entity_id", customer.id).order("created_at", { ascending: false }), customer.lead_id ? supabase.from("sales_quotes").select("id, pickup_location, delivery_location, stage, quoted_rate, created_at").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("brokerage_shipments").select("id, reference_number, status, sales_status, pickup_location, delivery_location, equipment_type, amount_quoted, pickup_date, delivery_date, created_at, updated_at").eq("customer_id", customer.id).order("created_at", { ascending: false })]);
+    const [activities, comments, quotes, shipments] = await Promise.all([customer.lead_id ? supabase.from("lead_activities").select("*").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("record_comments").select("*").eq("entity_type", "CUSTOMER").eq("entity_id", customer.id).order("created_at", { ascending: false }), customer.lead_id ? supabase.from("sales_quotes").select("id, pickup_location, delivery_location, stage, quoted_rate, created_at").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("brokerage_shipments").select("id, quote_id, reference_number, status, sales_status, pickup_location, delivery_location, equipment_type, amount_quoted, amount_agreed, pickup_date, delivery_date, created_at, updated_at").eq("customer_id", customer.id).order("created_at", { ascending: false })]);
     const canManage = isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id);
     response.json({ customer, can_edit: canAccessSalesCustomer(actor, customer, lead, scope, true), activities: await withAuthorDetails(supabase, activities.data ?? [], actor.id, canManage), comments: await withAuthorDetails(supabase, comments.data ?? [], actor.id, canManage), quotes: quotes.data ?? [], shipments: shipments.data ?? [] });
   } catch (error) { next(error); }
@@ -478,9 +489,15 @@ app.post("/api/v1/brokerage/customers/:id/shipments", requireBrokerageUser, asyn
     const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("id, team_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
     const scope = await teamScope(actor);
     if (!canAccessSalesCustomer(actor, customer, lead, scope, true)) return response.status(403).json({ error: "Customer shipment creation permission is required." });
-    const { quoted_rate, ...shipmentInput } = input;
-    const { data: shipment, error } = await supabase.from("brokerage_shipments").insert({ ...shipmentInput, customer_id: customer.id, sales_department_id: customer.sales_department_id, customer_name: customer.company_name, amount_quoted: quoted_rate ?? null, status: "BOOKED", sales_status: input.status }).select().single();
-    if (error || !shipment) throw error;
+    if (!lead?.id) return response.status(422).json({ error: "This customer is not linked to a Sales lead." });
+    const { quoted_rate, agreed_rate, status, reference_number, pickup_date, delivery_date, ...shipmentInput } = input;
+    const { data: quote, error: quoteError } = await supabase.from("sales_quotes").insert({ lead_id: lead.id, created_by: actor.id, pickup_location: shipmentInput.pickup_location, delivery_location: shipmentInput.delivery_location, equipment_type: shipmentInput.equipment_type ?? null, quoted_rate: quoted_rate ?? null }).select().single();
+    if (quoteError || !quote) throw quoteError;
+    const { data: shipment, error } = await supabase.from("brokerage_shipments").insert({ ...shipmentInput, quote_id: quote.id, reference_number, pickup_date: pickup_date ?? null, delivery_date: delivery_date ?? null, customer_id: customer.id, sales_department_id: customer.sales_department_id, customer_name: customer.company_name, amount_quoted: quoted_rate ?? null, amount_agreed: agreed_rate ?? null, status: "BOOKED", sales_status: status }).select().single();
+    if (error || !shipment) {
+      await supabase.from("sales_quotes").delete().eq("id", quote.id);
+      throw error;
+    }
     await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "SALES_SHIPMENT_CREATED", to_status: input.status });
     await writeAudit(supabase, actor.id, "SALES_SHIPMENT_CREATED", "shipment", shipment.id, { customer_id: customer.id, sales_status: input.status });
     response.status(201).json({ shipment });
@@ -502,12 +519,24 @@ app.patch("/api/v1/brokerage/sales-shipments/:id", requireBrokerageUser, async (
     const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("id, team_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
     const scope = await teamScope(actor);
     if (!canAccessSalesCustomer(actor, customer, lead, scope, true)) return response.status(403).json({ error: "Customer shipment update permission is required." });
-    const { quoted_rate, status, ...shipmentInput } = input;
+    const { quoted_rate, agreed_rate, status, ...shipmentInput } = input;
     const update: Record<string, unknown> = { ...shipmentInput };
     if (quoted_rate !== undefined) update.amount_quoted = quoted_rate;
+    if (agreed_rate !== undefined) update.amount_agreed = agreed_rate;
     if (status !== undefined) update.sales_status = status;
     const { data, error } = await supabase.from("brokerage_shipments").update(update).eq("id", shipment.id).select().single();
     if (error || !data) throw error;
+    if (shipment.quote_id) {
+      const quoteUpdate: Record<string, unknown> = {};
+      if (input.pickup_location !== undefined) quoteUpdate.pickup_location = input.pickup_location;
+      if (input.delivery_location !== undefined) quoteUpdate.delivery_location = input.delivery_location;
+      if (input.equipment_type !== undefined) quoteUpdate.equipment_type = input.equipment_type;
+      if (quoted_rate !== undefined) quoteUpdate.quoted_rate = quoted_rate;
+      if (Object.keys(quoteUpdate).length) {
+        const { error: quoteError } = await supabase.from("sales_quotes").update(quoteUpdate).eq("id", shipment.quote_id).in("stage", ["DRAFT", "REJECTED"]);
+        if (quoteError) throw quoteError;
+      }
+    }
     if (status && status !== shipment.sales_status) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "SALES_STATUS_CHANGED", from_status: shipment.sales_status, to_status: status });
     await writeAudit(supabase, actor.id, "SALES_SHIPMENT_UPDATED", "shipment", shipment.id, { fields: Object.keys(input) });
     response.json({ shipment: data });
