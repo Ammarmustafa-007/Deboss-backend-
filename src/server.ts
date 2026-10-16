@@ -829,7 +829,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
       : { data: [] as any[], error: null };
     if (customerError) throw customerError;
     const customerIds = (salesCustomers ?? []).map((customer) => customer.id);
-    let salesShipmentQuery = supabase.from("brokerage_shipments").select("id, customer_id, customer_name, sales_status, amount_quoted, pickup_date, delivery_date, created_at").order("created_at", { ascending: false }).limit(1000);
+    let salesShipmentQuery = supabase.from("brokerage_shipments").select("id, reference_number, customer_id, customer_name, sales_status, pickup_location, delivery_location, equipment_type, amount_quoted, amount_agreed, pickup_date, delivery_date, created_at, updated_at").order("created_at", { ascending: false }).limit(1000);
     salesShipmentQuery = customerIds.length ? salesShipmentQuery.in("customer_id", customerIds) : salesShipmentQuery.eq("id", "00000000-0000-0000-0000-000000000000");
     if (range.from) salesShipmentQuery = salesShipmentQuery.gte("created_at", `${range.from}T00:00:00.000Z`);
     if (range.to) salesShipmentQuery = salesShipmentQuery.lte("created_at", `${range.to}T23:59:59.999Z`);
@@ -858,7 +858,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
     const salesShipmentRows = salesShipments ?? [];
     const shipmentRows = shipments ?? [];
     const invoiceRows = invoices ?? [];
-    const customerNames = new Set((salesCustomers ?? []).map((customer) => customer.company_name));
+    const commercialValue = (rows: any[]) => rows.reduce((total, row) => total + Number(row.amount_agreed ?? row.amount_quoted ?? 0), 0);
     const ownerIds = [...new Set(leadRows.map((lead) => lead.owner_id).filter(Boolean))];
     const { data: owners } = ownerIds.length ? await supabase.from("profiles").select("id, full_name").in("id", ownerIds) : { data: [] as any[] };
     const ownerNames = new Map((owners ?? []).map((owner) => [owner.id, owner.full_name]));
@@ -875,7 +875,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
     response.json({
       range,
       sales: {
-        totals: { leads: leadRows.length, customers: customerNames.size, shipments: salesShipmentRows.length, pipeline_value: sum(leadRows, "estimated_monthly_value"), quoted_value: sum(quoteRows, "quoted_rate"), gross_generated: sum(salesShipmentRows.filter((shipment) => ["BOOKED", "DELIVERED", "PAID"].includes(shipment.sales_status)), "amount_quoted") },
+        totals: { leads: leadRows.length, customers: salesCustomers?.length ?? 0, shipments: salesShipmentRows.length, pipeline_value: sum(leadRows, "estimated_monthly_value"), quoted_value: sum(salesShipmentRows, "amount_quoted"), agreed_value: sum(salesShipmentRows, "amount_agreed"), gross_generated: commercialValue(salesShipmentRows.filter((shipment) => ["BOOKED", "DELIVERED", "PAID"].includes(shipment.sales_status))) },
         lead_stages: tally(leadRows, "stage"),
         quote_stages: tally(quoteRows, "stage"),
         shipment_statuses: tally(salesShipmentRows, "sales_status"),
