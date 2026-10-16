@@ -63,6 +63,7 @@ const teamSchema = z.object({ name: z.string().trim().min(2).max(80), team_lead_
 const teamUpdateSchema = teamSchema.partial().extend({ is_active: z.boolean().optional() });
 const leadUpdateSchema = leadSchema.partial().extend({ stage: z.enum(["NEW", "CONTACTED", "QUALIFIED", "CUSTOMER", "LOST"]).optional(), owner_id: z.string().uuid().optional(), team_id: z.string().uuid().nullable().optional(), archived_at: z.string().datetime().nullable().optional(), estimated_monthly_value: z.number().nonnegative().nullable().optional(), next_follow_up_at: z.string().datetime().nullable().optional() });
 const activitySchema = z.object({ activity_type: z.enum(["CALL", "EMAIL", "NOTE", "FOLLOW_UP", "APPOINTMENT"]), body: z.string().trim().min(1).max(3000), due_at: z.string().datetime().nullable().optional() });
+const activityCompletionSchema = z.object({ completed: z.boolean() });
 const quoteUpdateSchema = quoteSchema.omit({ lead_id: true }).partial();
 const reviewSchema = z.object({ action: z.enum(["APPROVE", "REJECT"]), note: z.string().trim().max(1000).optional() }).superRefine((value, context) => {
   if (value.action === "REJECT" && !value.note) context.addIssue({ code: z.ZodIssueCode.custom, path: ["note"], message: "A rejection reason is required." });
@@ -104,6 +105,14 @@ function canAccessSalesCustomer(actor: BrokerageRequest["actor"], customer: any,
   if (customer.owner_id === actor.id) return true;
   const permission = edit ? "sales.leads.edit_team" : "sales.leads.view_team";
   return Boolean(lead?.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has(permission));
+}
+async function withAuthorDetails(supabase: ReturnType<typeof adminClient>, rows: any[], actorId: string, canManage = false) {
+  const authorIds = [...new Set(rows.map((row) => row.author_id).filter(Boolean))];
+  if (!authorIds.length) return rows;
+  const { data: authors, error } = await supabase.from("profiles").select("id, full_name").in("id", authorIds);
+  if (error) throw error;
+  const names = new Map((authors ?? []).map((author: any) => [author.id, author.full_name]));
+  return rows.map((row) => ({ ...row, author_name: names.get(row.author_id) ?? "Unknown user", can_delete: canManage || row.author_id === actorId }));
 }
 async function validDepartmentPeople(departmentId: string, ids: string[]) {
   if (!ids.length) return true;
@@ -267,6 +276,7 @@ app.patch("/api/v1/brokerage/leads/:id", requireBrokerageUser, async (request: B
     if (leadError || !lead) return response.status(404).json({ error: "Lead not found." });
     const scope = await teamScope(actor); const teamEditor = !!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team");
     if (!(isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || teamEditor)) return response.status(403).json({ error: "You do not have permission to edit this lead." });
+    if (input.stage === "CUSTOMER") return response.status(422).json({ error: "Customer stage is set when you convert the lead to a customer profile." });
     if ((input.owner_id || input.team_id !== undefined) && !(isSuper(actor) || isManager(actor) || scope.permissions.has("sales.leads.assign"))) return response.status(403).json({ error: "Lead assignment permission is required." });
     if (input.owner_id && !await validDepartmentPeople(lead.department_id, [input.owner_id])) return response.status(422).json({ error: "The lead owner must be an active Sales Agent in this department." });
     if (input.team_id) { const { data: team } = await supabase.from("teams").select("id").eq("id", input.team_id).eq("department_id", lead.department_id).eq("is_active", true).maybeSingle(); if (!team) return response.status(422).json({ error: "The team must be active in this Sales department." }); }
@@ -289,12 +299,45 @@ app.post("/api/v1/brokerage/leads/:id/activities", requireBrokerageUser, async (
   } catch (error) { next(error); }
 });
 
+app.patch("/api/v1/brokerage/activities/:id", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
+  try {
+    const actor = request.actor!; const input = activityCompletionSchema.parse(request.body); const supabase = adminClient();
+    const { data: activity, error: activityError } = await supabase.from("lead_activities").select("id, lead_id, author_id").eq("id", z.string().uuid().parse(request.params.id)).single();
+    if (activityError || !activity) return response.status(404).json({ error: "Activity not found." });
+    const { data: lead } = await supabase.from("sales_leads").select("id, owner_id, team_id, department_id").eq("id", activity.lead_id).maybeSingle();
+    if (!lead) return response.status(404).json({ error: "Lead not found." });
+    const scope = await teamScope(actor); const teamEditor = !!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team");
+    if (!(activity.author_id === actor.id || isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || teamEditor)) return response.status(403).json({ error: "You do not have permission to update this activity." });
+    const { data, error } = await supabase.from("lead_activities").update({ completed_at: input.completed ? new Date().toISOString() : null }).eq("id", activity.id).select().single();
+    if (error) throw error;
+    await writeAudit(supabase, actor.id, input.completed ? "LEAD_ACTIVITY_COMPLETED" : "LEAD_ACTIVITY_REOPENED", "lead", lead.id, { activity_id: activity.id });
+    response.json({ activity: data });
+  } catch (error) { next(error); }
+});
+
+app.delete("/api/v1/brokerage/activities/:id", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
+  try {
+    const actor = request.actor!; const supabase = adminClient();
+    const { data: activity, error: activityError } = await supabase.from("lead_activities").select("id, lead_id, author_id").eq("id", z.string().uuid().parse(request.params.id)).single();
+    if (activityError || !activity) return response.status(404).json({ error: "Activity not found." });
+    const { data: lead } = await supabase.from("sales_leads").select("id, team_id, department_id").eq("id", activity.lead_id).maybeSingle();
+    if (!lead) return response.status(404).json({ error: "Lead not found." });
+    const scope = await teamScope(actor); const teamEditor = !!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team");
+    if (!(activity.author_id === actor.id || isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || teamEditor)) return response.status(403).json({ error: "You do not have permission to delete this activity." });
+    const { error } = await supabase.from("lead_activities").delete().eq("id", activity.id);
+    if (error) throw error;
+    await writeAudit(supabase, actor.id, "LEAD_ACTIVITY_DELETED", "lead", lead.id, { activity_id: activity.id });
+    response.status(204).end();
+  } catch (error) { next(error); }
+});
+
 app.get("/api/v1/brokerage/leads/:id/detail", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
   try {
     const actor = request.actor!; const supabase = adminClient(); const leadId = z.string().uuid().parse(request.params.id); const { data: lead, error } = await supabase.from("sales_leads").select("*").eq("id", leadId).single();
     if (error || !lead) return response.status(404).json({ error: "Lead not found." }); const scope = await teamScope(actor); const teamReadable = !!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.view_team"); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || teamReadable;
     if (!allowed) return response.status(403).json({ error: "Lead is outside your work scope." }); const [activities, comments, customer, quotes] = await Promise.all([supabase.from("lead_activities").select("*").eq("lead_id", lead.id).order("created_at", { ascending: false }), supabase.from("record_comments").select("*").eq("entity_type", "LEAD").eq("entity_id", lead.id).order("created_at", { ascending: false }), supabase.from("brokerage_customers").select("*").eq("lead_id", lead.id).maybeSingle(), supabase.from("sales_quotes").select("*").eq("lead_id", lead.id).order("updated_at", { ascending: false })]);
-    response.json({ lead, activities: activities.data ?? [], comments: comments.data ?? [], customer: customer.data ?? null, quotes: quotes.data ?? [] });
+    const canManage = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id);
+    response.json({ lead, activities: await withAuthorDetails(supabase, activities.data ?? [], actor.id, canManage), comments: await withAuthorDetails(supabase, comments.data ?? [], actor.id, canManage), customer: customer.data ?? null, quotes: quotes.data ?? [] });
   } catch (error) { next(error); }
 });
 
@@ -304,6 +347,25 @@ app.post("/api/v1/brokerage/leads/:id/comments", requireBrokerageUser, async (re
     if (error || !lead) return response.status(404).json({ error: "Lead not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (!!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team"));
     if (!allowed) return response.status(403).json({ error: "Lead is outside your work scope." }); const { data, error: insertError } = await supabase.from("record_comments").insert({ entity_type: "LEAD", entity_id: lead.id, author_id: actor.id, body: input.body }).select().single(); if (insertError) throw insertError;
     if (lead.owner_id !== actor.id) await supabase.from("notifications").insert({ recipient_id: lead.owner_id, kind: "LEAD_COMMENT", title: "New lead comment", body: input.body.slice(0, 140), entity_type: "LEAD", entity_id: lead.id }); await writeAudit(supabase, actor.id, "LEAD_COMMENT_ADDED", "lead", lead.id); response.status(201).json({ comment: data });
+  } catch (error) { next(error); }
+});
+
+app.delete("/api/v1/brokerage/comments/:id", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
+  try {
+    const actor = request.actor!; const supabase = adminClient();
+    const { data: comment, error: commentError } = await supabase.from("record_comments").select("id, entity_type, entity_id, author_id").eq("id", z.string().uuid().parse(request.params.id)).single();
+    if (commentError || !comment) return response.status(404).json({ error: "Comment not found." });
+    let departmentId: string | null = null;
+    if (comment.entity_type === "LEAD") { const { data: lead } = await supabase.from("sales_leads").select("department_id").eq("id", comment.entity_id).single(); departmentId = lead?.department_id ?? null; }
+    if (comment.entity_type === "CUSTOMER") { const { data: customer } = await supabase.from("brokerage_customers").select("sales_department_id").eq("id", comment.entity_id).single(); departmentId = customer?.sales_department_id ?? null; }
+    if (comment.entity_type === "QUOTE") { const { data: quote } = await supabase.from("sales_quotes").select("sales_leads(department_id)").eq("id", comment.entity_id).single(); const lead = Array.isArray((quote as any)?.sales_leads) ? (quote as any).sales_leads[0] : (quote as any)?.sales_leads; departmentId = lead?.department_id ?? null; }
+    if (comment.entity_type === "SHIPMENT") { const { data: shipment } = await supabase.from("brokerage_shipments").select("operations_department_id").eq("id", comment.entity_id).single(); departmentId = shipment?.operations_department_id ?? null; }
+    const canManage = isSuper(actor) || (isManager(actor) && actor.department_id === departmentId);
+    if (comment.author_id !== actor.id && !canManage) return response.status(403).json({ error: "Only the comment author or the responsible manager can delete this comment." });
+    const { error } = await supabase.from("record_comments").delete().eq("id", comment.id);
+    if (error) throw error;
+    await writeAudit(supabase, actor.id, "COMMENT_DELETED", comment.entity_type.toLowerCase(), comment.entity_id, { comment_id: comment.id });
+    response.status(204).end();
   } catch (error) { next(error); }
 });
 
@@ -327,7 +389,8 @@ app.get("/api/v1/brokerage/customers/:id/profile", requireBrokerageUser, async (
     const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id) || customer.owner_id === actor.id || (lead && !!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.view_team"));
     if (!allowed) return response.status(403).json({ error: "Customer is outside your work scope." });
     const [activities, comments, quotes, shipments] = await Promise.all([customer.lead_id ? supabase.from("lead_activities").select("*").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("record_comments").select("*").eq("entity_type", "CUSTOMER").eq("entity_id", customer.id).order("created_at", { ascending: false }), customer.lead_id ? supabase.from("sales_quotes").select("id, pickup_location, delivery_location, stage, quoted_rate, created_at").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("brokerage_shipments").select("id, reference_number, status, sales_status, pickup_location, delivery_location, equipment_type, amount_quoted, pickup_date, delivery_date, created_at, updated_at").eq("customer_id", customer.id).order("created_at", { ascending: false })]);
-    response.json({ customer, can_edit: canAccessSalesCustomer(actor, customer, lead, scope, true), activities: activities.data ?? [], comments: comments.data ?? [], quotes: quotes.data ?? [], shipments: shipments.data ?? [] });
+    const canManage = isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id);
+    response.json({ customer, can_edit: canAccessSalesCustomer(actor, customer, lead, scope, true), activities: await withAuthorDetails(supabase, activities.data ?? [], actor.id, canManage), comments: await withAuthorDetails(supabase, comments.data ?? [], actor.id, canManage), quotes: quotes.data ?? [], shipments: shipments.data ?? [] });
   } catch (error) { next(error); }
 });
 
@@ -496,7 +559,7 @@ app.get("/api/v1/brokerage/quotes/:id/detail", requireBrokerageUser, async (requ
     const actor = request.actor!; const supabase = adminClient(); const quoteId = z.string().uuid().parse(request.params.id);
     const { data: quote, error } = await supabase.from("sales_quotes").select("*, sales_leads(id, owner_id, team_id, department_id)").eq("id", quoteId).single(); if (error || !quote) return response.status(404).json({ error: "Quote not found." });
     const lead: any = Array.isArray((quote as any).sales_leads) ? (quote as any).sales_leads[0] : (quote as any).sales_leads; const scope = await teamScope(actor); const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (!!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.view_team")));
-    if (!allowed) return response.status(403).json({ error: "Quote is outside your work scope." }); const [attachments, events, comments] = await Promise.all([supabase.from("quote_attachments").select("*").eq("quote_id", quoteId).order("created_at", { ascending: false }), supabase.from("quote_events").select("*").eq("quote_id", quoteId).order("created_at", { ascending: false }), supabase.from("record_comments").select("*").eq("entity_type", "QUOTE").eq("entity_id", quoteId).order("created_at", { ascending: false })]); response.json({ quote, attachments: attachments.data ?? [], events: events.data ?? [], comments: comments.data ?? [] });
+    if (!allowed) return response.status(403).json({ error: "Quote is outside your work scope." }); const [attachments, events, comments] = await Promise.all([supabase.from("quote_attachments").select("*").eq("quote_id", quoteId).order("created_at", { ascending: false }), supabase.from("quote_events").select("*").eq("quote_id", quoteId).order("created_at", { ascending: false }), supabase.from("record_comments").select("*").eq("entity_type", "QUOTE").eq("entity_id", quoteId).order("created_at", { ascending: false })]); const canManage = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id); response.json({ quote, attachments: attachments.data ?? [], events: events.data ?? [], comments: await withAuthorDetails(supabase, comments.data ?? [], actor.id, canManage) });
   } catch (error) { next(error); }
 });
 
