@@ -680,7 +680,13 @@ app.post("/api/v1/brokerage/quotes/:id/handoff", requireBrokerageUser, async (re
     if (!allowed) return response.status(403).json({ error: "Operations handoff permission is required." }); if ((quote as any).stage !== "APPROVED") return response.status(422).json({ error: "Only an approved quote can be handed to Operations." });
     const { data: operationsDepartment } = await supabase.from("departments").select("id, business_unit, function").eq("id", input.operations_department_id).single(); if (!operationsDepartment || (operationsDepartment as any).business_unit !== "BROKERAGE" || (operationsDepartment as any).function !== "OPERATIONS") return response.status(422).json({ error: "Choose a Brokerage Operations department." });
     const { data: customer } = await supabase.from("brokerage_customers").select("id").eq("lead_id", lead.id).maybeSingle();
-    const { data: shipment, error } = await supabase.from("brokerage_shipments").insert({ quote_id: quote.id, customer_id: customer?.id ?? null, sales_department_id: lead.department_id, operations_department_id: input.operations_department_id, team_id: input.team_id ?? null, reference_number: input.reference_number, customer_name: input.customer_name, pickup_location: (quote as any).pickup_location, delivery_location: (quote as any).delivery_location, equipment_type: (quote as any).equipment_type, amount_quoted: (quote as any).quoted_rate ?? null, sales_status: "BOOKED" }).select().single();
+    // Since Sales creates the shipment together with its quote (quote_id is unique), handoff moves that same
+    // record into Operations. Quotes from before that change have no shipment yet, so one is created for them.
+    const { data: existing } = await supabase.from("brokerage_shipments").select("id, customer_id, sales_status, amount_quoted").eq("quote_id", quote.id).maybeSingle();
+    const handoffFields = { operations_department_id: input.operations_department_id, team_id: input.team_id ?? null, reference_number: input.reference_number, customer_name: input.customer_name, status: "BOOKED" };
+    const { data: shipment, error } = existing
+      ? await supabase.from("brokerage_shipments").update({ ...handoffFields, customer_id: existing.customer_id ?? customer?.id ?? null, amount_quoted: existing.amount_quoted ?? (quote as any).quoted_rate ?? null, sales_status: ["DELIVERED", "PAID"].includes((existing as any).sales_status) ? (existing as any).sales_status : "BOOKED" }).eq("id", existing.id).select().single()
+      : await supabase.from("brokerage_shipments").insert({ ...handoffFields, quote_id: quote.id, customer_id: customer?.id ?? null, sales_department_id: lead.department_id, pickup_location: (quote as any).pickup_location, delivery_location: (quote as any).delivery_location, equipment_type: (quote as any).equipment_type, amount_quoted: (quote as any).quoted_rate ?? null, sales_status: "BOOKED" }).select().single();
     if (error) throw error;
     await supabase.from("sales_quotes").update({ stage: "HANDED_OFF" }).eq("id", quote.id);
     const { data: operationsManagers } = await supabase.from("profiles").select("id").eq("department_id", input.operations_department_id).eq("role", "MANAGER").eq("is_active", true);
@@ -931,7 +937,10 @@ app.use((_request, response) => response.status(404).json({ error: "Route not fo
 app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
   console.error(error);
   if (error instanceof z.ZodError) return response.status(400).json({ error: "Invalid request data.", issues: error.issues });
-  response.status(500).json({ error: error instanceof Error ? error.message : "An unexpected server error occurred." });
+  // Supabase returns plain objects ({ code, message, details }), not Error instances.
+  const database = error as { code?: string; message?: string; details?: string } | null;
+  if (database?.code === "23505") return response.status(409).json({ error: database.details?.includes("reference_number") ? "That shipment reference number is already in use. Choose a different one." : "This record already exists." });
+  response.status(500).json({ error: error instanceof Error ? error.message : database?.message ?? "An unexpected server error occurred." });
 });
 
 app.listen(port, () => console.log(`DEBOSS API listening on port ${port}`));
