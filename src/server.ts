@@ -85,6 +85,19 @@ async function writeAudit(supabase: ReturnType<typeof adminClient>, actorId: str
   await supabase.from("audit_events").insert({ actor_id: actorId, action, entity_type: entityType, entity_id: entityId, detail });
 }
 
+/** Creates the shipment's invoice once (IN-2). Defaults to net 30 so overdue tracking works (IN-4). */
+async function ensureInvoice(supabase: ReturnType<typeof adminClient>, shipment: any, actorId: string, input: { amount?: number; amount_paid?: number; status?: string; due_date?: string | null } = {}, automatic = false) {
+  const { data: existing } = await supabase.from("brokerage_invoices").select("*").eq("shipment_id", shipment.id).maybeSingle();
+  if (existing) return { invoice: existing, created: false };
+  const issued = new Date();
+  const due = new Date(issued.getTime() + 30 * 86_400_000).toISOString().slice(0, 10);
+  const invoiceNumber = `INV-${issued.getUTCFullYear()}-${shipment.reference_number}-${shipment.id.slice(0, 6).toUpperCase()}`;
+  const { data: invoice, error } = await supabase.from("brokerage_invoices").insert({ shipment_id: shipment.id, department_id: shipment.operations_department_id, invoice_number: invoiceNumber, amount: input.amount ?? shipment.amount_invoiced ?? shipment.amount_agreed ?? shipment.amount_quoted ?? 0, amount_paid: input.amount_paid ?? shipment.amount_paid ?? 0, status: input.status ?? "DRAFT", due_date: input.due_date === undefined ? due : input.due_date, issued_at: issued.toISOString(), created_by: actorId }).select().single();
+  if (error || !invoice) throw error;
+  await writeAudit(supabase, actorId, "INVOICE_GENERATED", "invoice", invoice.id, { shipment_id: shipment.id, automatic });
+  return { invoice, created: true };
+}
+
 async function teamScope(actor: BrokerageRequest["actor"]) {
   const supabase = adminClient();
   if (!actor) return { teamIds: [] as string[], leadTeamIds: [] as string[], permissions: new Set<string>() };
@@ -734,6 +747,10 @@ app.patch("/api/v1/brokerage/shipments/:id", requireBrokerageUser, async (reques
     if (input.team_id !== undefined) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "TEAM_ASSIGNED", body: input.team_id ?? "Team removed" });
     if (input.exception_owner_id !== undefined) { await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "EXCEPTION_OWNER_ASSIGNED", body: input.exception_owner_id ?? "Unassigned" }); if (input.exception_owner_id && input.exception_owner_id !== actor.id) await supabase.from("notifications").insert({ recipient_id: input.exception_owner_id, kind: "EXCEPTION_ASSIGNED", title: "Exception assigned", body: `${shipment.reference_number} needs your attention.`, entity_type: "SHIPMENT", entity_id: shipment.id }); }
     if (input.status && input.status !== shipment.status) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "STATUS_CHANGED", from_status: shipment.status, to_status: input.status });
+    if (input.status && ["DELIVERED", "COMPLETED"].includes(input.status) && shipment.operations_department_id) {
+      const { created, invoice } = await ensureInvoice(supabase, data, actor.id, {}, true);
+      if (created) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "INVOICE_GENERATED", body: invoice.invoice_number });
+    }
     if (input.exception_note !== undefined) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: input.exception_note ? "EXCEPTION_RAISED" : "EXCEPTION_RESOLVED", body: input.exception_note ?? null });
     if (input.exception_resolution !== undefined) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "EXCEPTION_RESOLUTION_UPDATED", body: input.exception_resolution ?? null });
     if (input.invoice_ready) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "INVOICE_READY" }); if (note) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "NOTE", body: note });
@@ -748,11 +765,9 @@ app.post("/api/v1/brokerage/shipments/:id/invoice", requireBrokerageUser, async 
     if (error || !shipment) return response.status(404).json({ error: "Shipment not found." });
     if (!(isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id))) return response.status(403).json({ error: "Only the Operations Manager can generate an invoice." });
     if (!['DELIVERED', 'COMPLETED'].includes(shipment.status)) return response.status(422).json({ error: "A shipment must be delivered before invoicing." });
-    const { data: existing } = await supabase.from("brokerage_invoices").select("*").eq("shipment_id", shipment.id).maybeSingle();
-    if (existing) return response.json({ invoice: existing, existing: true });
-    const input = invoiceSchema.parse(request.body ?? {}); const invoiceNumber = `INV-${new Date().getUTCFullYear()}-${shipment.reference_number}-${shipment.id.slice(0, 6).toUpperCase()}`;
-    const { data: invoice, error: invoiceError } = await supabase.from("brokerage_invoices").insert({ shipment_id: shipment.id, department_id: shipment.operations_department_id, invoice_number: invoiceNumber, amount: input.amount ?? shipment.amount_invoiced ?? shipment.amount_quoted ?? 0, amount_paid: input.amount_paid ?? shipment.amount_paid ?? 0, status: input.status ?? 'DRAFT', due_date: input.due_date ?? null, issued_at: new Date().toISOString(), created_by: actor.id }).select().single();
-    if (invoiceError || !invoice) throw invoiceError; await writeAudit(supabase, actor.id, "INVOICE_GENERATED", "invoice", invoice.id, { shipment_id: shipment.id }); response.status(201).json({ invoice });
+    const input = invoiceSchema.parse(request.body ?? {});
+    const { invoice, created } = await ensureInvoice(supabase, shipment, actor.id, input);
+    response.status(created ? 201 : 200).json({ invoice, existing: !created });
   } catch (error) { next(error); }
 });
 
@@ -765,7 +780,7 @@ app.patch("/api/v1/brokerage/invoices/:id", requireBrokerageUser, async (request
     const update: Record<string, unknown> = { ...input }; if (input.status === 'PAID') update.paid_at = new Date().toISOString();
     const { data, error: updateError } = await supabase.from("brokerage_invoices").update(update).eq("id", invoice.id).select().single(); if (updateError || !data) throw updateError;
     await supabase.from("brokerage_shipments").update({ amount_invoiced: input.amount ?? invoice.amount, amount_paid: input.amount_paid ?? invoice.amount_paid, payment_status: input.status ?? invoice.status, ...(input.status === "PAID" ? { sales_status: "PAID" } : {}) }).eq("id", invoice.shipment_id);
-    await writeAudit(supabase, actor.id, "INVOICE_UPDATED", "invoice", invoice.id, { fields: Object.keys(input) }); response.json({ invoice: data });
+    await writeAudit(supabase, actor.id, "INVOICE_UPDATED", "invoice", invoice.id, { from_status: invoice.status, to_status: input.status ?? invoice.status, fields: Object.keys(input) }); response.json({ invoice: data });
   } catch (error) { next(error); }
 });
 
@@ -901,6 +916,23 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
       row.shipments += 1;
       if (["BOOKED", "DELIVERED", "PAID"].includes(shipment.sales_status)) row.gross_generated += Number(shipment.amount_agreed ?? shipment.amount_quoted ?? 0);
     });
+    // Operations per agent: shipments, delivered, invoiced and collected (BO-7), with names instead of IDs.
+    const opsAgentIds = [...new Set(shipmentRows.map((shipment) => shipment.assigned_to).filter(Boolean))];
+    const { data: opsPeople } = opsAgentIds.length ? await supabase.from("profiles").select("id, full_name").in("id", opsAgentIds) : { data: [] as any[] };
+    const opsName = new Map((opsPeople ?? []).map((person) => [person.id, person.full_name]));
+    const invoiceByShipment = new Map(invoiceRows.map((invoice) => [invoice.shipment_id, invoice]));
+    const opsAgentRows = new Map<string, { agent_id: string | null; name: string; shipments: number; delivered: number; invoiced: number; collected: number }>();
+    for (const shipment of shipmentRows) {
+      const key = shipment.assigned_to ?? "unassigned";
+      const row = opsAgentRows.get(key) ?? { agent_id: shipment.assigned_to ?? null, name: shipment.assigned_to ? opsName.get(shipment.assigned_to) ?? "Unknown agent" : "Unassigned", shipments: 0, delivered: 0, invoiced: 0, collected: 0 };
+      row.shipments += 1;
+      if (["DELIVERED", "COMPLETED"].includes(shipment.status)) row.delivered += 1;
+      const invoice = invoiceByShipment.get(shipment.id);
+      if (invoice) { row.invoiced += Number(invoice.amount ?? 0); row.collected += Number(invoice.amount_paid ?? 0); }
+      opsAgentRows.set(key, row);
+    }
+    const opsAgents = [...opsAgentRows.values()].sort((left, right) => right.invoiced - left.invoiced);
+    const opsWorkload = Object.fromEntries(opsAgents.map((row) => [row.name, row.shipments]));
     const customerOutcomes = salesShipmentRows.reduce((totals: Record<string, number>, shipment) => {
       const label = `${shipment.customer_name} · ${shipment.sales_status}`;
       totals[label] = (totals[label] ?? 0) + 1;
@@ -925,7 +957,8 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
       operations: {
         totals: { shipments: shipmentRows.length, quoted: sum(shipmentRows, "amount_quoted"), invoiced: sum(invoiceRows, "amount"), paid: sum(invoiceRows, "amount_paid"), outstanding: Math.max(0, sum(invoiceRows, "amount") - sum(invoiceRows, "amount_paid")) },
         shipment_statuses: tally(shipmentRows, "status"),
-        workload: tally(shipmentRows, "assigned_to"),
+        workload: opsWorkload,
+        agent_breakdown: opsAgents,
         by_team: tally(shipmentRows, "team_id"),
         by_customer: tally(shipmentRows, "customer_name"),
         invoice_statuses: tally(invoiceRows, "status"),
