@@ -98,6 +98,30 @@ async function ensureInvoice(supabase: ReturnType<typeof adminClient>, shipment:
   return { invoice, created: true };
 }
 
+/**
+ * Flags unpaid invoices past their due date as Overdue (IN-4), audits the change (IN-5) and notifies the
+ * invoice creator and the department's Operations managers. Runs on a schedule and when invoices are listed.
+ */
+async function markOverdueInvoices(supabase: ReturnType<typeof adminClient>, departmentId?: string) {
+  let overdueQuery = supabase.from("brokerage_invoices").select("id, invoice_number, status, created_by, department_id").lt("due_date", new Date().toISOString().slice(0, 10)).in("status", ["DRAFT", "SENT", "PENDING"]);
+  if (departmentId) overdueQuery = overdueQuery.eq("department_id", departmentId);
+  const { data: overdue, error } = await overdueQuery;
+  if (error) throw error;
+  if (!overdue?.length) return 0;
+  const { error: updateError } = await supabase.from("brokerage_invoices").update({ status: "OVERDUE" }).in("id", overdue.map((invoice) => invoice.id));
+  if (updateError) throw updateError;
+  const departmentIds = [...new Set(overdue.map((invoice) => invoice.department_id).filter(Boolean))];
+  const { data: managers } = departmentIds.length ? await supabase.from("profiles").select("id, department_id").in("department_id", departmentIds).eq("role", "MANAGER").eq("is_active", true) : { data: [] as any[] };
+  const alerts: Record<string, unknown>[] = [];
+  for (const invoice of overdue) {
+    const recipients = new Set<string>([invoice.created_by, ...(managers ?? []).filter((manager) => manager.department_id === invoice.department_id).map((manager) => manager.id)].filter(Boolean));
+    for (const recipient of recipients) alerts.push({ recipient_id: recipient, kind: "INVOICE_OVERDUE", title: "Invoice overdue", body: `${invoice.invoice_number} passed its due date.`, entity_type: "INVOICE", entity_id: invoice.id });
+    await writeAudit(supabase, invoice.created_by, "INVOICE_UPDATED", "invoice", invoice.id, { from_status: invoice.status, to_status: "OVERDUE", automatic: true });
+  }
+  if (alerts.length) await supabase.from("notifications").insert(alerts);
+  return overdue.length;
+}
+
 async function teamScope(actor: BrokerageRequest["actor"]) {
   const supabase = adminClient();
   if (!actor) return { teamIds: [] as string[], leadTeamIds: [] as string[], permissions: new Set<string>() };
@@ -789,15 +813,7 @@ app.get("/api/v1/brokerage/invoices", requireBrokerageUser, async (request: Brok
     const actor = request.actor!;
     if (!(isSuper(actor) || (isOperations(actor) && actor.department_id))) return response.status(403).json({ error: "Operations access is required." });
     const supabase = adminClient();
-    let overdueQuery = supabase.from("brokerage_invoices").select("id, invoice_number, created_by, department_id").lt("due_date", new Date().toISOString().slice(0, 10)).in("status", ["DRAFT", "SENT", "PENDING"]);
-    if (!isSuper(actor)) overdueQuery = overdueQuery.eq("department_id", actor.department_id!);
-    const { data: overdue, error: overdueError } = await overdueQuery;
-    if (overdueError) throw overdueError;
-    if (overdue?.length) {
-      await supabase.from("brokerage_invoices").update({ status: "OVERDUE" }).in("id", overdue.map((invoice) => invoice.id));
-      const alerts = overdue.filter((invoice) => invoice.created_by !== actor.id).map((invoice) => ({ recipient_id: invoice.created_by, kind: "INVOICE_OVERDUE", title: "Invoice overdue", body: `${invoice.invoice_number} passed its due date.`, entity_type: "INVOICE", entity_id: invoice.id }));
-      if (alerts.length) await supabase.from("notifications").insert(alerts);
-    }
+    await markOverdueInvoices(supabase, isSuper(actor) ? undefined : actor.department_id!);
     let query = supabase.from("brokerage_invoices").select("*, brokerage_shipments(reference_number, customer_name, assigned_to)").order("updated_at", { ascending: false }).limit(200);
     if (!isSuper(actor)) query = query.eq("department_id", actor.department_id!);
     const { data, error } = await query;
@@ -933,6 +949,28 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
     }
     const opsAgents = [...opsAgentRows.values()].sort((left, right) => right.invoiced - left.invoiced);
     const opsWorkload = Object.fromEntries(opsAgents.map((row) => [row.name, row.shipments]));
+    const opsTeamIds = [...new Set(shipmentRows.map((shipment) => shipment.team_id).filter(Boolean))];
+    const { data: opsTeams } = opsTeamIds.length ? await supabase.from("teams").select("id, name").in("id", opsTeamIds) : { data: [] as any[] };
+    const opsTeamName = new Map((opsTeams ?? []).map((team) => [team.id, team.name]));
+    const rollUp = (keyOf: (shipment: any) => string) => {
+      const rows = new Map<string, { name: string; shipments: number; delivered: number; invoiced: number; collected: number; outstanding: number }>();
+      for (const shipment of shipmentRows) {
+        const name = keyOf(shipment);
+        const row = rows.get(name) ?? { name, shipments: 0, delivered: 0, invoiced: 0, collected: 0, outstanding: 0 };
+        row.shipments += 1;
+        if (["DELIVERED", "COMPLETED"].includes(shipment.status)) row.delivered += 1;
+        const invoice = invoiceByShipment.get(shipment.id);
+        if (invoice) {
+          row.invoiced += Number(invoice.amount ?? 0);
+          row.collected += Number(invoice.amount_paid ?? 0);
+          if (invoice.status !== "CANCELLED") row.outstanding += Math.max(0, Number(invoice.amount ?? 0) - Number(invoice.amount_paid ?? 0));
+        }
+        rows.set(name, row);
+      }
+      return [...rows.values()].sort((left, right) => right.invoiced - left.invoiced);
+    };
+    const opsByTeam = rollUp((shipment) => shipment.team_id ? opsTeamName.get(shipment.team_id) ?? "Unknown team" : "No team");
+    const opsByCustomer = rollUp((shipment) => shipment.customer_name ?? "Unknown customer");
     const customerOutcomes = salesShipmentRows.reduce((totals: Record<string, number>, shipment) => {
       const label = `${shipment.customer_name} · ${shipment.sales_status}`;
       totals[label] = (totals[label] ?? 0) + 1;
@@ -959,6 +997,8 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
         shipment_statuses: tally(shipmentRows, "status"),
         workload: opsWorkload,
         agent_breakdown: opsAgents,
+        team_breakdown: opsByTeam,
+        customer_breakdown: opsByCustomer,
         by_team: tally(shipmentRows, "team_id"),
         by_customer: tally(shipmentRows, "customer_name"),
         invoice_statuses: tally(invoiceRows, "status"),
@@ -1029,3 +1069,8 @@ app.use((error: unknown, _request: Request, response: Response, _next: NextFunct
 });
 
 app.listen(port, () => console.log(`DEBOSS API listening on port ${port}`));
+
+// Overdue invoices are flagged hourly even when nobody opens the invoice list (IN-4).
+const overdueSweep = () => { if (!supabaseUrl || !serviceRoleKey) return; markOverdueInvoices(adminClient()).then((count) => { if (count) console.log(`Marked ${count} invoice(s) overdue.`); }).catch((error) => console.error("Overdue invoice check failed", error)); };
+setTimeout(overdueSweep, 10_000);
+setInterval(overdueSweep, 60 * 60 * 1000);
