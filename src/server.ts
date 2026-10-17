@@ -5,6 +5,7 @@ import helmet from "helmet";
 import morgan from "morgan";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
+import { registerPayrollRoutes } from "./payroll.js";
 
 const port = Number(process.env.PORT ?? 4000);
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -975,6 +976,8 @@ app.get("/api/v1/brokerage/department-users", requireBrokerageUser, async (reque
 app.patch("/api/v1/brokerage/department-users/:id", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
   try { const actor = request.actor!; const userId = z.string().uuid().parse(request.params.id); const input = z.object({ is_active: z.boolean().optional() }).strict().parse(request.body); if (!isManager(actor) || !actor.department_id) return response.status(403).json({ error: "Manager access is required." }); const supabase = adminClient(); const { data: target } = await supabase.from("profiles").select("id, role").eq("id", userId).eq("department_id", actor.department_id).maybeSingle(); if (!target || target.role !== "AGENT") return response.status(404).json({ error: "Agent not found in your department." }); if (input.is_active !== undefined) { const { error } = await supabase.from("profiles").update({ is_active: input.is_active }).eq("id", userId); if (error) throw error; await writeAudit(supabase, actor.id, input.is_active ? "ACCESS_RESTORED" : "ACCESS_REVOKED", "profile", userId); } response.json({ ok: true }); } catch (error) { next(error); }
 });
+
+registerPayrollRoutes(app, { adminClient, requireSuperAdmin: requireSuperAdmin as never, requireBrokerageUser: requireBrokerageUser as never, writeAudit: writeAudit as never });
 
 app.use((_request, response) => response.status(404).json({ error: "Route not found." }));
 app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
