@@ -979,7 +979,13 @@ app.patch("/api/v1/brokerage/department-users/:id", requireBrokerageUser, async 
 app.use((_request, response) => response.status(404).json({ error: "Route not found." }));
 app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
   console.error(error);
-  if (error instanceof z.ZodError) return response.status(400).json({ error: "Invalid request data.", issues: error.issues });
+  if (error instanceof z.ZodError) {
+    // Name the first problem field in plain words, e.g. "Reference number: must be at least 3 characters."
+    const issue = error.issues[0];
+    const field = issue?.path.length ? String(issue.path[issue.path.length - 1]).replaceAll("_", " ").replace(/^\w/, (letter) => letter.toUpperCase()) : "";
+    const detail = issue?.code === "too_small" && "minimum" in issue ? `must be at least ${issue.minimum} characters` : issue?.code === "too_big" && "maximum" in issue ? `must be at most ${issue.maximum} characters` : issue?.message?.toLowerCase() ?? "is not valid";
+    return response.status(400).json({ error: field ? `${field}: ${detail}.` : "Invalid request data.", issues: error.issues });
+  }
   // Supabase returns plain objects ({ code, message, details }), not Error instances.
   const database = error as { code?: string; message?: string; details?: string } | null;
   if (database?.code === "23505") return response.status(409).json({ error: database.details?.includes("reference_number") ? "That shipment reference number is already in use. Choose a different one." : "This record already exists." });
