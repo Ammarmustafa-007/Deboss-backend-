@@ -62,7 +62,7 @@ const nullableUuid = z.preprocess((value) => value === "" ? null : value, z.stri
 const teamSchema = z.object({ name: z.string().trim().min(2).max(80), team_lead_id: nullableUuid, member_ids: z.array(z.string().uuid()).min(1), permissions: z.array(z.string()).default([]) });
 const teamUpdateSchema = teamSchema.partial().extend({ is_active: z.boolean().optional() });
 const leadUpdateSchema = leadSchema.partial().extend({ stage: z.enum(["NEW", "CONTACTED", "QUALIFIED", "CUSTOMER", "LOST"]).optional(), owner_id: z.string().uuid().optional(), team_id: z.string().uuid().nullable().optional(), archived_at: z.string().datetime().nullable().optional(), estimated_monthly_value: z.number().nonnegative().nullable().optional(), next_follow_up_at: z.string().datetime().nullable().optional() });
-const activitySchema = z.object({ activity_type: z.enum(["CALL", "EMAIL", "NOTE", "FOLLOW_UP", "APPOINTMENT"]), body: z.string().trim().min(1).max(3000), due_at: z.string().datetime().nullable().optional() });
+const activitySchema = z.object({ activity_type: z.enum(["CALL", "CALLBACK", "EMAIL", "NOTE", "FOLLOW_UP", "APPOINTMENT"]), body: z.string().trim().min(1).max(3000), due_at: z.string().datetime().nullable().optional() });
 const activityCompletionSchema = z.object({ completed: z.boolean() });
 const quoteUpdateSchema = quoteSchema.omit({ lead_id: true }).partial();
 const reviewSchema = z.object({ action: z.enum(["APPROVE", "REJECT"]), note: z.string().trim().max(1000).optional() }).superRefine((value, context) => {
@@ -139,6 +139,7 @@ app.post("/api/v1/users", requireSuperAdmin, async (request, response, next) => 
     if (createError || !created.user) return response.status(422).json({ error: createError?.message ?? "Unable to create the user." });
     const { data: profile, error: updateError } = await supabase.from("profiles").update({ full_name: input.full_name, email: input.email, role: input.role, department_id: input.role === "SUPER_ADMIN" ? null : input.department_id, is_active: true }).eq("id", created.user.id).select().single();
     if (updateError) { await supabase.auth.admin.deleteUser(created.user.id); throw updateError; }
+    await writeAudit(supabase, (request as AuthenticatedRequest).actor!.id, "USER_CREATED", "profile", created.user.id, { role: input.role, department_id: profile.department_id });
     response.status(201).json({ user: profile });
   } catch (error) { next(error); }
 });
@@ -154,6 +155,8 @@ app.patch("/api/v1/users/:id", requireSuperAdmin, async (request, response, next
       const { error } = await supabase.auth.admin.updateUserById(userId, { password });
       if (error) return response.status(422).json({ error: error.message });
     }
+    const auditAction = profileUpdate.is_active === false ? "ACCESS_REVOKED" : profileUpdate.is_active === true ? "ACCESS_RESTORED" : "USER_UPDATED";
+    await writeAudit(supabase, (request as AuthenticatedRequest).actor!.id, auditAction, "profile", userId, { changes: profileUpdate, password_changed: Boolean(password) });
     if (Object.keys(profileUpdate).length) {
       const { data, error } = await supabase.from("profiles").update(profileUpdate).eq("id", userId).select().single();
       if (error) throw error;
@@ -202,7 +205,7 @@ app.post("/api/v1/brokerage/leads", requireBrokerageUser, async (request: Broker
     if (actor.department?.business_unit !== "BROKERAGE" || actor.department?.function !== "SALES" || !actor.department_id) return response.status(403).json({ error: "Only Brokerage Sales users can create leads." });
     const { data: membership } = await adminClient().from("team_members").select("team_id").eq("user_id", actor.id).limit(1).maybeSingle();
     const { data, error } = await adminClient().from("sales_leads").insert({ ...input, contact_email: input.contact_email || null, department_id: actor.department_id, owner_id: actor.id, team_id: membership?.team_id ?? null }).select().single();
-    if (error) throw error; response.status(201).json({ lead: data });
+    if (error) throw error; await writeAudit(adminClient(), actor.id, "LEAD_CREATED", "lead", data.id); response.status(201).json({ lead: data });
   } catch (error) { next(error); }
 });
 
@@ -873,6 +876,30 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
       totals[label] = (totals[label] ?? 0) + 1;
       return totals;
     }, {});
+    const teamIds = [...new Set(leadRows.map((lead) => lead.team_id).filter(Boolean))];
+    const { data: teamNames } = teamIds.length ? await supabase.from("teams").select("id, name").in("id", teamIds) : { data: [] as any[] };
+    const teamLabel = new Map((teamNames ?? []).map((team) => [team.id, team.name]));
+    const salesByTeam = leadRows.reduce((totals: Record<string, number>, lead) => {
+      const label = lead.team_id ? teamLabel.get(lead.team_id) ?? "Unknown team" : "No team";
+      totals[label] = (totals[label] ?? 0) + 1;
+      return totals;
+    }, {});
+    // Per-agent roll-up: opportunities, customers, shipments and gross (shipments attribute to the customer's owner).
+    const customerOwner = new Map((salesCustomers ?? []).map((customer) => [customer.id, customer.owner_id]));
+    const agentRows = new Map<string, { agent_id: string; name: string; leads: number; customers: number; shipments: number; gross_generated: number }>();
+    const agentRow = (id: string) => {
+      if (!agentRows.has(id)) agentRows.set(id, { agent_id: id, name: ownerNames.get(id) ?? "Unassigned", leads: 0, customers: 0, shipments: 0, gross_generated: 0 });
+      return agentRows.get(id)!;
+    };
+    leadRows.forEach((lead) => { if (lead.owner_id) agentRow(lead.owner_id).leads += 1; });
+    (salesCustomers ?? []).forEach((customer) => { if (customer.owner_id) agentRow(customer.owner_id).customers += 1; });
+    salesShipmentRows.forEach((shipment) => {
+      const owner = customerOwner.get(shipment.customer_id);
+      if (!owner) return;
+      const row = agentRow(owner);
+      row.shipments += 1;
+      if (["BOOKED", "DELIVERED", "PAID"].includes(shipment.sales_status)) row.gross_generated += Number(shipment.amount_agreed ?? shipment.amount_quoted ?? 0);
+    });
     const customerOutcomes = salesShipmentRows.reduce((totals: Record<string, number>, shipment) => {
       const label = `${shipment.customer_name} · ${shipment.sales_status}`;
       totals[label] = (totals[label] ?? 0) + 1;
@@ -887,7 +914,8 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
         shipment_statuses: tally(salesShipmentRows, "sales_status"),
         customer_outcomes: customerOutcomes,
         by_agent: salesByAgent,
-        by_team: tally(leadRows, "team_id"),
+        by_team: salesByTeam,
+        agent_breakdown: [...agentRows.values()].sort((left, right) => right.gross_generated - left.gross_generated),
         rows: salesShipmentRows.length ? salesShipmentRows : leadRows,
         lead_rows: leadRows,
         shipment_rows: salesShipmentRows,
@@ -923,6 +951,21 @@ app.post("/api/v1/brokerage/shipments/:id/upload-url", requireBrokerageUser, asy
 
 app.post("/api/v1/brokerage/shipments/:id/comments", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
   try { const actor = request.actor!; const input = commentSchema.parse(request.body); const supabase = adminClient(); const { data: shipment } = await supabase.from("brokerage_shipments").select("*").eq("id", z.string().uuid().parse(request.params.id)).maybeSingle(); if (!shipment) return response.status(404).json({ error: "Shipment not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id) || shipment.assigned_to === actor.id || (!!shipment.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.shipments.view_team")); if (!allowed) return response.status(403).json({ error: "Shipment is outside your work scope." }); const { data, error } = await supabase.from("record_comments").insert({ entity_type: "SHIPMENT", entity_id: shipment.id, author_id: actor.id, body: input.body }).select().single(); if (error) throw error; if (shipment.assigned_to && shipment.assigned_to !== actor.id) await supabase.from("notifications").insert({ recipient_id: shipment.assigned_to, kind: "SHIPMENT_COMMENT", title: "New shipment comment", body: input.body.slice(0, 140), entity_type: "SHIPMENT", entity_id: shipment.id }); await writeAudit(supabase, actor.id, "COMMENT_ADDED", "shipment", shipment.id); response.status(201).json({ comment: data }); } catch (error) { next(error); }
+});
+
+app.post("/api/v1/brokerage/department-users", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
+  try {
+    const actor = request.actor!;
+    if (!isManager(actor) || !actor.department_id) return response.status(403).json({ error: "Manager access is required." });
+    const input = z.object({ full_name: z.string().trim().min(2).max(100), email: z.string().trim().email(), password: z.string().min(8).max(128) }).strict().parse(request.body);
+    const supabase = adminClient();
+    const { data: created, error: createError } = await supabase.auth.admin.createUser({ email: input.email, password: input.password, email_confirm: true });
+    if (createError || !created.user) return response.status(422).json({ error: createError?.message ?? "Unable to create the agent." });
+    const { data: profile, error: updateError } = await supabase.from("profiles").update({ full_name: input.full_name, email: input.email, role: "AGENT", department_id: actor.department_id, is_active: true }).eq("id", created.user.id).select("id, full_name, email, role, is_active").single();
+    if (updateError) { await supabase.auth.admin.deleteUser(created.user.id); throw updateError; }
+    await writeAudit(supabase, actor.id, "USER_CREATED", "profile", created.user.id, { role: "AGENT", department_id: actor.department_id });
+    response.status(201).json({ user: profile });
+  } catch (error) { next(error); }
 });
 
 app.get("/api/v1/brokerage/department-users", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
