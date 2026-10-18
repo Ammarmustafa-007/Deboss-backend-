@@ -21,9 +21,43 @@ app.use(morgan("dev"));
 type AuthenticatedRequest = Request & { actor?: { id: string; email?: string } };
 type BrokerageRequest = Request & { actor?: { id: string; role: string; department_id: string | null; department?: { business_unit: string; function: string } | null } };
 
+const makeAdminClient = () => createClient(supabaseUrl!, serviceRoleKey!, { auth: { autoRefreshToken: false, persistSession: false } });
+let adminInstance: ReturnType<typeof makeAdminClient> | null = null;
 function adminClient() {
   if (!supabaseUrl || !serviceRoleKey) throw new Error("Supabase Admin is not configured.");
-  return createClient(supabaseUrl, serviceRoleKey, { auth: { autoRefreshToken: false, persistSession: false } });
+  adminInstance ??= makeAdminClient();
+  return adminInstance;
+}
+
+// ---- Request authentication -------------------------------------------------
+// One long-lived auth client so the project's public signing keys (JWKS) are fetched once and reused:
+// getClaims() then verifies tokens locally instead of a network round-trip per request, and falls back
+// to the Auth server automatically for symmetric (legacy) keys.
+const makeAuthClient = () => createClient(supabaseUrl!, publishableKey!, { auth: { autoRefreshToken: false, persistSession: false } });
+let authInstance: ReturnType<typeof makeAuthClient> | null = null;
+async function verifiedUserId(token: string) {
+  authInstance ??= makeAuthClient();
+  const { data, error } = await authInstance.auth.getClaims(token);
+  const userId = data?.claims?.sub;
+  return error || typeof userId !== "string" ? null : userId;
+}
+
+// Profiles and team rights are cached briefly; any access or team change clears them immediately.
+const CACHE_MS = 30_000;
+type CachedProfile = { id: string; role: string; department_id: string | null; is_active: boolean; department: { business_unit: string; function: string } | null };
+const profileCache = new Map<string, { value: CachedProfile | null; expires: number }>();
+const teamScopeCache = new Map<string, { value: { teamIds: string[]; leadTeamIds: string[]; permissions: Set<string> }; expires: number }>();
+function clearAccessCache(userId?: string) {
+  if (userId) profileCache.delete(userId); else profileCache.clear();
+  teamScopeCache.clear();
+}
+async function cachedProfile(userId: string): Promise<CachedProfile | null> {
+  const hit = profileCache.get(userId);
+  if (hit && hit.expires > Date.now()) return hit.value;
+  const { data: profile } = await adminClient().from("profiles").select("id, role, department_id, is_active, departments!profiles_department_id_fkey(business_unit, function)").eq("id", userId).maybeSingle();
+  const value = profile ? { id: profile.id, role: profile.role, department_id: profile.department_id, is_active: profile.is_active, department: (Array.isArray(profile.departments) ? profile.departments[0] : profile.departments) ?? null } as CachedProfile : null;
+  profileCache.set(userId, { value, expires: Date.now() + CACHE_MS });
+  return value;
 }
 
 async function requireSuperAdmin(request: AuthenticatedRequest, response: Response, next: NextFunction) {
@@ -31,12 +65,11 @@ async function requireSuperAdmin(request: AuthenticatedRequest, response: Respon
     if (!supabaseUrl || !publishableKey) return response.status(503).json({ error: "Authentication service is not configured." });
     const token = request.header("authorization")?.replace(/^Bearer\s+/i, "");
     if (!token) return response.status(401).json({ error: "A bearer token is required." });
-    const sessionClient = createClient(supabaseUrl, publishableKey);
-    const { data: userData, error: userError } = await sessionClient.auth.getUser(token);
-    if (userError || !userData.user) return response.status(401).json({ error: "Your session is invalid or has expired." });
-    const { data: profile, error: profileError } = await adminClient().from("profiles").select("role").eq("id", userData.user.id).single();
-    if (profileError || profile?.role !== "SUPER_ADMIN") return response.status(403).json({ error: "Super Admin access is required." });
-    request.actor = { id: userData.user.id, email: userData.user.email };
+    const userId = await verifiedUserId(token);
+    if (!userId) return response.status(401).json({ error: "Your session is invalid or has expired." });
+    const profile = await cachedProfile(userId);
+    if (!profile?.is_active || profile.role !== "SUPER_ADMIN") return response.status(403).json({ error: "Super Admin access is required." });
+    request.actor = { id: userId };
     next();
   } catch (error) { next(error); }
 }
@@ -46,11 +79,11 @@ async function requireBrokerageUser(request: BrokerageRequest, response: Respons
     if (!supabaseUrl || !publishableKey) return response.status(503).json({ error: "Authentication service is not configured." });
     const token = request.header("authorization")?.replace(/^Bearer\s+/i, "");
     if (!token) return response.status(401).json({ error: "A bearer token is required." });
-    const { data: userData, error: userError } = await createClient(supabaseUrl, publishableKey).auth.getUser(token);
-    if (userError || !userData.user) return response.status(401).json({ error: "Your session is invalid or has expired." });
-    const { data: profile, error } = await adminClient().from("profiles").select("id, role, department_id, is_active, departments!profiles_department_id_fkey(business_unit, function)").eq("id", userData.user.id).single();
-    if (error || !profile?.is_active) return response.status(403).json({ error: "Your account is inactive or incomplete." });
-    request.actor = { id: profile.id, role: profile.role, department_id: profile.department_id, department: Array.isArray(profile.departments) ? profile.departments[0] : profile.departments };
+    const userId = await verifiedUserId(token);
+    if (!userId) return response.status(401).json({ error: "Your session is invalid or has expired." });
+    const profile = await cachedProfile(userId);
+    if (!profile?.is_active) return response.status(403).json({ error: "Your account is inactive or incomplete." });
+    request.actor = { id: profile.id, role: profile.role, department_id: profile.department_id, department: profile.department };
     next();
   } catch (error) { next(error); }
 }
@@ -125,12 +158,16 @@ async function markOverdueInvoices(supabase: ReturnType<typeof adminClient>, dep
 async function teamScope(actor: BrokerageRequest["actor"]) {
   const supabase = adminClient();
   if (!actor) return { teamIds: [] as string[], leadTeamIds: [] as string[], permissions: new Set<string>() };
+  const hit = teamScopeCache.get(actor.id);
+  if (hit && hit.expires > Date.now()) return hit.value;
   const { data: memberships } = await supabase.from("team_members").select("team_id, teams(team_lead_id, is_active)").eq("user_id", actor.id);
   const teamIds = (memberships ?? []).map((row: any) => row.team_id);
   const leadTeamIds = (memberships ?? []).filter((row: any) => { const team = Array.isArray(row.teams) ? row.teams[0] : row.teams; return team?.is_active && team.team_lead_id === actor.id; }).map((row: any) => row.team_id);
   // Delegated Team Lead permissions only apply while the actor is the selected lead.
   const { data: grants } = leadTeamIds.length ? await supabase.from("team_lead_permissions").select("permission_key").eq("user_id", actor.id).in("team_id", leadTeamIds) : { data: [] as any[] };
-  return { teamIds, leadTeamIds, permissions: new Set((grants ?? []).map((row: any) => row.permission_key)) };
+  const value = { teamIds, leadTeamIds, permissions: new Set((grants ?? []).map((row: any) => row.permission_key)) };
+  teamScopeCache.set(actor.id, { value, expires: Date.now() + CACHE_MS });
+  return value;
 }
 function isManager(actor: BrokerageRequest["actor"]) { return actor?.role === "MANAGER"; }
 function isSuper(actor: BrokerageRequest["actor"]) { return actor?.role === "SUPER_ADMIN"; }
@@ -194,7 +231,7 @@ app.patch("/api/v1/users/:id", requireSuperAdmin, async (request, response, next
       if (error) return response.status(422).json({ error: error.message });
     }
     const auditAction = profileUpdate.is_active === false ? "ACCESS_REVOKED" : profileUpdate.is_active === true ? "ACCESS_RESTORED" : "USER_UPDATED";
-    await writeAudit(supabase, (request as AuthenticatedRequest).actor!.id, auditAction, "profile", userId, { changes: profileUpdate, password_changed: Boolean(password) });
+    clearAccessCache(userId); await writeAudit(supabase, (request as AuthenticatedRequest).actor!.id, auditAction, "profile", userId, { changes: profileUpdate, password_changed: Boolean(password) });
     if (Object.keys(profileUpdate).length) {
       const { data, error } = await supabase.from("profiles").update(profileUpdate).eq("id", userId).select().single();
       if (error) throw error;
@@ -274,7 +311,7 @@ app.post("/api/v1/brokerage/teams", requireBrokerageUser, async (request: Broker
       const { error: permissionError } = await supabase.from("team_lead_permissions").insert(input.permissions.map((permission_key) => ({ team_id: team.id, user_id: input.team_lead_id, permission_key, granted_by: actor.id })));
       if (permissionError) throw permissionError;
     }
-    await writeAudit(supabase, actor.id, "TEAM_CREATED", "team", team.id, { member_count: memberIds.length, team_lead_id: input.team_lead_id ?? null });
+    clearAccessCache(); await writeAudit(supabase, actor.id, "TEAM_CREATED", "team", team.id, { member_count: memberIds.length, team_lead_id: input.team_lead_id ?? null });
     response.status(201).json({ team });
   } catch (error) { next(error); }
 });
@@ -305,7 +342,7 @@ app.patch("/api/v1/brokerage/teams/:id", requireBrokerageUser, async (request: B
     if (member_ids) { const merged = [...new Set([...member_ids, ...(teamLeadId ? [teamLeadId] : [])])]; if (!await validDepartmentPeople(actor.department_id, merged)) return response.status(422).json({ error: "Team members must belong to your department." }); await supabase.from("team_members").delete().eq("team_id", teamId); const { error } = await supabase.from("team_members").insert(merged.map((user_id) => ({ team_id: teamId, user_id }))); if (error) throw error; }
     const leadChanged = input.team_lead_id !== undefined && input.team_lead_id !== existing.team_lead_id;
     if (permissions !== undefined || leadChanged) { await supabase.from("team_lead_permissions").delete().eq("team_id", teamId); const delegatedPermissions = permissions ?? []; if (teamLeadId && delegatedPermissions.length) { const { error } = await supabase.from("team_lead_permissions").insert(delegatedPermissions.map((permission_key) => ({ team_id: teamId, user_id: teamLeadId, permission_key, granted_by: actor.id }))); if (error) throw error; } }
-    await writeAudit(supabase, actor.id, "TEAM_UPDATED", "team", teamId);
+    clearAccessCache(); await writeAudit(supabase, actor.id, "TEAM_UPDATED", "team", teamId);
     response.json({ ok: true });
   } catch (error) { next(error); }
 });
@@ -1047,7 +1084,7 @@ app.get("/api/v1/brokerage/department-users", requireBrokerageUser, async (reque
 });
 
 app.patch("/api/v1/brokerage/department-users/:id", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
-  try { const actor = request.actor!; const userId = z.string().uuid().parse(request.params.id); const input = z.object({ is_active: z.boolean().optional() }).strict().parse(request.body); if (!isManager(actor) || !actor.department_id) return response.status(403).json({ error: "Manager access is required." }); const supabase = adminClient(); const { data: target } = await supabase.from("profiles").select("id, role").eq("id", userId).eq("department_id", actor.department_id).maybeSingle(); if (!target || target.role !== "AGENT") return response.status(404).json({ error: "Agent not found in your department." }); if (input.is_active !== undefined) { const { error } = await supabase.from("profiles").update({ is_active: input.is_active }).eq("id", userId); if (error) throw error; await writeAudit(supabase, actor.id, input.is_active ? "ACCESS_RESTORED" : "ACCESS_REVOKED", "profile", userId); } response.json({ ok: true }); } catch (error) { next(error); }
+  try { const actor = request.actor!; const userId = z.string().uuid().parse(request.params.id); const input = z.object({ is_active: z.boolean().optional() }).strict().parse(request.body); if (!isManager(actor) || !actor.department_id) return response.status(403).json({ error: "Manager access is required." }); const supabase = adminClient(); const { data: target } = await supabase.from("profiles").select("id, role").eq("id", userId).eq("department_id", actor.department_id).maybeSingle(); if (!target || target.role !== "AGENT") return response.status(404).json({ error: "Agent not found in your department." }); if (input.is_active !== undefined) { const { error } = await supabase.from("profiles").update({ is_active: input.is_active }).eq("id", userId); if (error) throw error; clearAccessCache(userId); await writeAudit(supabase, actor.id, input.is_active ? "ACCESS_RESTORED" : "ACCESS_REVOKED", "profile", userId); } response.json({ ok: true }); } catch (error) { next(error); }
 });
 
 registerPayrollRoutes(app, { adminClient, requireSuperAdmin: requireSuperAdmin as never, requireBrokerageUser: requireBrokerageUser as never, writeAudit: writeAudit as never });
