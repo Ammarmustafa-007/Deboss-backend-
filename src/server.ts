@@ -813,6 +813,12 @@ app.patch("/api/v1/brokerage/shipments/:id", requireBrokerageUser, async (reques
       if (created) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "INVOICE_GENERATED", body: invoice.invoice_number });
     }
     if (input.exception_note !== undefined) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: input.exception_note ? "EXCEPTION_RAISED" : "EXCEPTION_RESOLVED", body: input.exception_note ?? null });
+    // A newly raised exception alerts the department's Operations managers.
+    if (input.exception_note && input.exception_note !== shipment.exception_note && shipment.operations_department_id) {
+      const { data: managers } = await supabase.from("profiles").select("id").eq("department_id", shipment.operations_department_id).eq("role", "MANAGER").eq("is_active", true);
+      const alerts = (managers ?? []).filter((manager) => manager.id !== actor.id).map((manager) => ({ recipient_id: manager.id, kind: "EXCEPTION_RAISED", title: `Exception on ${shipment.reference_number}`, body: input.exception_note!.slice(0, 140), entity_type: "SHIPMENT", entity_id: shipment.id }));
+      if (alerts.length) await supabase.from("notifications").insert(alerts);
+    }
     if (input.exception_resolution !== undefined) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "EXCEPTION_RESOLUTION_UPDATED", body: input.exception_resolution ?? null });
     if (input.invoice_ready) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "INVOICE_READY" }); if (note) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "NOTE", body: note });
     await writeAudit(supabase, actor.id, "SHIPMENT_UPDATED", "shipment", shipment.id, { fields: Object.keys(input) }); response.json({ shipment: data });
