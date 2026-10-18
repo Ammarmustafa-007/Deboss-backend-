@@ -21,9 +21,43 @@ app.use(morgan("dev"));
 type AuthenticatedRequest = Request & { actor?: { id: string; email?: string } };
 type BrokerageRequest = Request & { actor?: { id: string; role: string; department_id: string | null; department?: { business_unit: string; function: string } | null } };
 
+const makeAdminClient = () => createClient(supabaseUrl!, serviceRoleKey!, { auth: { autoRefreshToken: false, persistSession: false } });
+let adminInstance: ReturnType<typeof makeAdminClient> | null = null;
 function adminClient() {
   if (!supabaseUrl || !serviceRoleKey) throw new Error("Supabase Admin is not configured.");
-  return createClient(supabaseUrl, serviceRoleKey, { auth: { autoRefreshToken: false, persistSession: false } });
+  adminInstance ??= makeAdminClient();
+  return adminInstance;
+}
+
+// ---- Request authentication -------------------------------------------------
+// One long-lived auth client so the project's public signing keys (JWKS) are fetched once and reused:
+// getClaims() then verifies tokens locally instead of a network round-trip per request, and falls back
+// to the Auth server automatically for symmetric (legacy) keys.
+const makeAuthClient = () => createClient(supabaseUrl!, publishableKey!, { auth: { autoRefreshToken: false, persistSession: false } });
+let authInstance: ReturnType<typeof makeAuthClient> | null = null;
+async function verifiedUserId(token: string) {
+  authInstance ??= makeAuthClient();
+  const { data, error } = await authInstance.auth.getClaims(token);
+  const userId = data?.claims?.sub;
+  return error || typeof userId !== "string" ? null : userId;
+}
+
+// Profiles and team rights are cached briefly; any access or team change clears them immediately.
+const CACHE_MS = 30_000;
+type CachedProfile = { id: string; role: string; department_id: string | null; is_active: boolean; department: { business_unit: string; function: string } | null };
+const profileCache = new Map<string, { value: CachedProfile | null; expires: number }>();
+const teamScopeCache = new Map<string, { value: { teamIds: string[]; leadTeamIds: string[]; permissions: Set<string> }; expires: number }>();
+function clearAccessCache(userId?: string) {
+  if (userId) profileCache.delete(userId); else profileCache.clear();
+  teamScopeCache.clear();
+}
+async function cachedProfile(userId: string): Promise<CachedProfile | null> {
+  const hit = profileCache.get(userId);
+  if (hit && hit.expires > Date.now()) return hit.value;
+  const { data: profile } = await adminClient().from("profiles").select("id, role, department_id, is_active, departments!profiles_department_id_fkey(business_unit, function)").eq("id", userId).maybeSingle();
+  const value = profile ? { id: profile.id, role: profile.role, department_id: profile.department_id, is_active: profile.is_active, department: (Array.isArray(profile.departments) ? profile.departments[0] : profile.departments) ?? null } as CachedProfile : null;
+  profileCache.set(userId, { value, expires: Date.now() + CACHE_MS });
+  return value;
 }
 
 async function requireSuperAdmin(request: AuthenticatedRequest, response: Response, next: NextFunction) {
@@ -31,12 +65,11 @@ async function requireSuperAdmin(request: AuthenticatedRequest, response: Respon
     if (!supabaseUrl || !publishableKey) return response.status(503).json({ error: "Authentication service is not configured." });
     const token = request.header("authorization")?.replace(/^Bearer\s+/i, "");
     if (!token) return response.status(401).json({ error: "A bearer token is required." });
-    const sessionClient = createClient(supabaseUrl, publishableKey);
-    const { data: userData, error: userError } = await sessionClient.auth.getUser(token);
-    if (userError || !userData.user) return response.status(401).json({ error: "Your session is invalid or has expired." });
-    const { data: profile, error: profileError } = await adminClient().from("profiles").select("role").eq("id", userData.user.id).single();
-    if (profileError || profile?.role !== "SUPER_ADMIN") return response.status(403).json({ error: "Super Admin access is required." });
-    request.actor = { id: userData.user.id, email: userData.user.email };
+    const userId = await verifiedUserId(token);
+    if (!userId) return response.status(401).json({ error: "Your session is invalid or has expired." });
+    const profile = await cachedProfile(userId);
+    if (!profile?.is_active || profile.role !== "SUPER_ADMIN") return response.status(403).json({ error: "Super Admin access is required." });
+    request.actor = { id: userId };
     next();
   } catch (error) { next(error); }
 }
@@ -46,11 +79,11 @@ async function requireBrokerageUser(request: BrokerageRequest, response: Respons
     if (!supabaseUrl || !publishableKey) return response.status(503).json({ error: "Authentication service is not configured." });
     const token = request.header("authorization")?.replace(/^Bearer\s+/i, "");
     if (!token) return response.status(401).json({ error: "A bearer token is required." });
-    const { data: userData, error: userError } = await createClient(supabaseUrl, publishableKey).auth.getUser(token);
-    if (userError || !userData.user) return response.status(401).json({ error: "Your session is invalid or has expired." });
-    const { data: profile, error } = await adminClient().from("profiles").select("id, role, department_id, is_active, departments!profiles_department_id_fkey(business_unit, function)").eq("id", userData.user.id).single();
-    if (error || !profile?.is_active) return response.status(403).json({ error: "Your account is inactive or incomplete." });
-    request.actor = { id: profile.id, role: profile.role, department_id: profile.department_id, department: Array.isArray(profile.departments) ? profile.departments[0] : profile.departments };
+    const userId = await verifiedUserId(token);
+    if (!userId) return response.status(401).json({ error: "Your session is invalid or has expired." });
+    const profile = await cachedProfile(userId);
+    if (!profile?.is_active) return response.status(403).json({ error: "Your account is inactive or incomplete." });
+    request.actor = { id: profile.id, role: profile.role, department_id: profile.department_id, department: profile.department };
     next();
   } catch (error) { next(error); }
 }
@@ -85,15 +118,56 @@ async function writeAudit(supabase: ReturnType<typeof adminClient>, actorId: str
   await supabase.from("audit_events").insert({ actor_id: actorId, action, entity_type: entityType, entity_id: entityId, detail });
 }
 
+/** Creates the shipment's invoice once (IN-2). Defaults to net 30 so overdue tracking works (IN-4). */
+async function ensureInvoice(supabase: ReturnType<typeof adminClient>, shipment: any, actorId: string, input: { amount?: number; amount_paid?: number; status?: string; due_date?: string | null } = {}, automatic = false) {
+  const { data: existing } = await supabase.from("brokerage_invoices").select("*").eq("shipment_id", shipment.id).maybeSingle();
+  if (existing) return { invoice: existing, created: false };
+  const issued = new Date();
+  const due = new Date(issued.getTime() + 30 * 86_400_000).toISOString().slice(0, 10);
+  const invoiceNumber = `INV-${issued.getUTCFullYear()}-${shipment.reference_number}-${shipment.id.slice(0, 6).toUpperCase()}`;
+  const { data: invoice, error } = await supabase.from("brokerage_invoices").insert({ shipment_id: shipment.id, department_id: shipment.operations_department_id, invoice_number: invoiceNumber, amount: input.amount ?? shipment.amount_invoiced ?? shipment.amount_agreed ?? shipment.amount_quoted ?? 0, amount_paid: input.amount_paid ?? shipment.amount_paid ?? 0, status: input.status ?? "DRAFT", due_date: input.due_date === undefined ? due : input.due_date, issued_at: issued.toISOString(), created_by: actorId }).select().single();
+  if (error || !invoice) throw error;
+  await writeAudit(supabase, actorId, "INVOICE_GENERATED", "invoice", invoice.id, { shipment_id: shipment.id, automatic });
+  return { invoice, created: true };
+}
+
+/**
+ * Flags unpaid invoices past their due date as Overdue (IN-4), audits the change (IN-5) and notifies the
+ * invoice creator and the department's Operations managers. Runs on a schedule and when invoices are listed.
+ */
+async function markOverdueInvoices(supabase: ReturnType<typeof adminClient>, departmentId?: string) {
+  let overdueQuery = supabase.from("brokerage_invoices").select("id, invoice_number, status, created_by, department_id").lt("due_date", new Date().toISOString().slice(0, 10)).in("status", ["DRAFT", "SENT", "PENDING"]);
+  if (departmentId) overdueQuery = overdueQuery.eq("department_id", departmentId);
+  const { data: overdue, error } = await overdueQuery;
+  if (error) throw error;
+  if (!overdue?.length) return 0;
+  const { error: updateError } = await supabase.from("brokerage_invoices").update({ status: "OVERDUE" }).in("id", overdue.map((invoice) => invoice.id));
+  if (updateError) throw updateError;
+  const departmentIds = [...new Set(overdue.map((invoice) => invoice.department_id).filter(Boolean))];
+  const { data: managers } = departmentIds.length ? await supabase.from("profiles").select("id, department_id").in("department_id", departmentIds).eq("role", "MANAGER").eq("is_active", true) : { data: [] as any[] };
+  const alerts: Record<string, unknown>[] = [];
+  for (const invoice of overdue) {
+    const recipients = new Set<string>([invoice.created_by, ...(managers ?? []).filter((manager) => manager.department_id === invoice.department_id).map((manager) => manager.id)].filter(Boolean));
+    for (const recipient of recipients) alerts.push({ recipient_id: recipient, kind: "INVOICE_OVERDUE", title: "Invoice overdue", body: `${invoice.invoice_number} passed its due date.`, entity_type: "INVOICE", entity_id: invoice.id });
+    await writeAudit(supabase, invoice.created_by, "INVOICE_UPDATED", "invoice", invoice.id, { from_status: invoice.status, to_status: "OVERDUE", automatic: true });
+  }
+  if (alerts.length) await supabase.from("notifications").insert(alerts);
+  return overdue.length;
+}
+
 async function teamScope(actor: BrokerageRequest["actor"]) {
   const supabase = adminClient();
   if (!actor) return { teamIds: [] as string[], leadTeamIds: [] as string[], permissions: new Set<string>() };
+  const hit = teamScopeCache.get(actor.id);
+  if (hit && hit.expires > Date.now()) return hit.value;
   const { data: memberships } = await supabase.from("team_members").select("team_id, teams(team_lead_id, is_active)").eq("user_id", actor.id);
   const teamIds = (memberships ?? []).map((row: any) => row.team_id);
   const leadTeamIds = (memberships ?? []).filter((row: any) => { const team = Array.isArray(row.teams) ? row.teams[0] : row.teams; return team?.is_active && team.team_lead_id === actor.id; }).map((row: any) => row.team_id);
   // Delegated Team Lead permissions only apply while the actor is the selected lead.
   const { data: grants } = leadTeamIds.length ? await supabase.from("team_lead_permissions").select("permission_key").eq("user_id", actor.id).in("team_id", leadTeamIds) : { data: [] as any[] };
-  return { teamIds, leadTeamIds, permissions: new Set((grants ?? []).map((row: any) => row.permission_key)) };
+  const value = { teamIds, leadTeamIds, permissions: new Set((grants ?? []).map((row: any) => row.permission_key)) };
+  teamScopeCache.set(actor.id, { value, expires: Date.now() + CACHE_MS });
+  return value;
 }
 function isManager(actor: BrokerageRequest["actor"]) { return actor?.role === "MANAGER"; }
 function isSuper(actor: BrokerageRequest["actor"]) { return actor?.role === "SUPER_ADMIN"; }
@@ -157,7 +231,7 @@ app.patch("/api/v1/users/:id", requireSuperAdmin, async (request, response, next
       if (error) return response.status(422).json({ error: error.message });
     }
     const auditAction = profileUpdate.is_active === false ? "ACCESS_REVOKED" : profileUpdate.is_active === true ? "ACCESS_RESTORED" : "USER_UPDATED";
-    await writeAudit(supabase, (request as AuthenticatedRequest).actor!.id, auditAction, "profile", userId, { changes: profileUpdate, password_changed: Boolean(password) });
+    clearAccessCache(userId); await writeAudit(supabase, (request as AuthenticatedRequest).actor!.id, auditAction, "profile", userId, { changes: profileUpdate, password_changed: Boolean(password) });
     if (Object.keys(profileUpdate).length) {
       const { data, error } = await supabase.from("profiles").update(profileUpdate).eq("id", userId).select().single();
       if (error) throw error;
@@ -237,7 +311,7 @@ app.post("/api/v1/brokerage/teams", requireBrokerageUser, async (request: Broker
       const { error: permissionError } = await supabase.from("team_lead_permissions").insert(input.permissions.map((permission_key) => ({ team_id: team.id, user_id: input.team_lead_id, permission_key, granted_by: actor.id })));
       if (permissionError) throw permissionError;
     }
-    await writeAudit(supabase, actor.id, "TEAM_CREATED", "team", team.id, { member_count: memberIds.length, team_lead_id: input.team_lead_id ?? null });
+    clearAccessCache(); await writeAudit(supabase, actor.id, "TEAM_CREATED", "team", team.id, { member_count: memberIds.length, team_lead_id: input.team_lead_id ?? null });
     response.status(201).json({ team });
   } catch (error) { next(error); }
 });
@@ -268,7 +342,7 @@ app.patch("/api/v1/brokerage/teams/:id", requireBrokerageUser, async (request: B
     if (member_ids) { const merged = [...new Set([...member_ids, ...(teamLeadId ? [teamLeadId] : [])])]; if (!await validDepartmentPeople(actor.department_id, merged)) return response.status(422).json({ error: "Team members must belong to your department." }); await supabase.from("team_members").delete().eq("team_id", teamId); const { error } = await supabase.from("team_members").insert(merged.map((user_id) => ({ team_id: teamId, user_id }))); if (error) throw error; }
     const leadChanged = input.team_lead_id !== undefined && input.team_lead_id !== existing.team_lead_id;
     if (permissions !== undefined || leadChanged) { await supabase.from("team_lead_permissions").delete().eq("team_id", teamId); const delegatedPermissions = permissions ?? []; if (teamLeadId && delegatedPermissions.length) { const { error } = await supabase.from("team_lead_permissions").insert(delegatedPermissions.map((permission_key) => ({ team_id: teamId, user_id: teamLeadId, permission_key, granted_by: actor.id }))); if (error) throw error; } }
-    await writeAudit(supabase, actor.id, "TEAM_UPDATED", "team", teamId);
+    clearAccessCache(); await writeAudit(supabase, actor.id, "TEAM_UPDATED", "team", teamId);
     response.json({ ok: true });
   } catch (error) { next(error); }
 });
@@ -734,7 +808,17 @@ app.patch("/api/v1/brokerage/shipments/:id", requireBrokerageUser, async (reques
     if (input.team_id !== undefined) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "TEAM_ASSIGNED", body: input.team_id ?? "Team removed" });
     if (input.exception_owner_id !== undefined) { await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "EXCEPTION_OWNER_ASSIGNED", body: input.exception_owner_id ?? "Unassigned" }); if (input.exception_owner_id && input.exception_owner_id !== actor.id) await supabase.from("notifications").insert({ recipient_id: input.exception_owner_id, kind: "EXCEPTION_ASSIGNED", title: "Exception assigned", body: `${shipment.reference_number} needs your attention.`, entity_type: "SHIPMENT", entity_id: shipment.id }); }
     if (input.status && input.status !== shipment.status) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "STATUS_CHANGED", from_status: shipment.status, to_status: input.status });
+    if (input.status && ["DELIVERED", "COMPLETED"].includes(input.status) && shipment.operations_department_id) {
+      const { created, invoice } = await ensureInvoice(supabase, data, actor.id, {}, true);
+      if (created) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "INVOICE_GENERATED", body: invoice.invoice_number });
+    }
     if (input.exception_note !== undefined) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: input.exception_note ? "EXCEPTION_RAISED" : "EXCEPTION_RESOLVED", body: input.exception_note ?? null });
+    // A newly raised exception alerts the department's Operations managers.
+    if (input.exception_note && input.exception_note !== shipment.exception_note && shipment.operations_department_id) {
+      const { data: managers } = await supabase.from("profiles").select("id").eq("department_id", shipment.operations_department_id).eq("role", "MANAGER").eq("is_active", true);
+      const alerts = (managers ?? []).filter((manager) => manager.id !== actor.id).map((manager) => ({ recipient_id: manager.id, kind: "EXCEPTION_RAISED", title: `Exception on ${shipment.reference_number}`, body: input.exception_note!.slice(0, 140), entity_type: "SHIPMENT", entity_id: shipment.id }));
+      if (alerts.length) await supabase.from("notifications").insert(alerts);
+    }
     if (input.exception_resolution !== undefined) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "EXCEPTION_RESOLUTION_UPDATED", body: input.exception_resolution ?? null });
     if (input.invoice_ready) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "INVOICE_READY" }); if (note) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "NOTE", body: note });
     await writeAudit(supabase, actor.id, "SHIPMENT_UPDATED", "shipment", shipment.id, { fields: Object.keys(input) }); response.json({ shipment: data });
@@ -748,11 +832,9 @@ app.post("/api/v1/brokerage/shipments/:id/invoice", requireBrokerageUser, async 
     if (error || !shipment) return response.status(404).json({ error: "Shipment not found." });
     if (!(isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id))) return response.status(403).json({ error: "Only the Operations Manager can generate an invoice." });
     if (!['DELIVERED', 'COMPLETED'].includes(shipment.status)) return response.status(422).json({ error: "A shipment must be delivered before invoicing." });
-    const { data: existing } = await supabase.from("brokerage_invoices").select("*").eq("shipment_id", shipment.id).maybeSingle();
-    if (existing) return response.json({ invoice: existing, existing: true });
-    const input = invoiceSchema.parse(request.body ?? {}); const invoiceNumber = `INV-${new Date().getUTCFullYear()}-${shipment.reference_number}-${shipment.id.slice(0, 6).toUpperCase()}`;
-    const { data: invoice, error: invoiceError } = await supabase.from("brokerage_invoices").insert({ shipment_id: shipment.id, department_id: shipment.operations_department_id, invoice_number: invoiceNumber, amount: input.amount ?? shipment.amount_invoiced ?? shipment.amount_quoted ?? 0, amount_paid: input.amount_paid ?? shipment.amount_paid ?? 0, status: input.status ?? 'DRAFT', due_date: input.due_date ?? null, issued_at: new Date().toISOString(), created_by: actor.id }).select().single();
-    if (invoiceError || !invoice) throw invoiceError; await writeAudit(supabase, actor.id, "INVOICE_GENERATED", "invoice", invoice.id, { shipment_id: shipment.id }); response.status(201).json({ invoice });
+    const input = invoiceSchema.parse(request.body ?? {});
+    const { invoice, created } = await ensureInvoice(supabase, shipment, actor.id, input);
+    response.status(created ? 201 : 200).json({ invoice, existing: !created });
   } catch (error) { next(error); }
 });
 
@@ -765,7 +847,7 @@ app.patch("/api/v1/brokerage/invoices/:id", requireBrokerageUser, async (request
     const update: Record<string, unknown> = { ...input }; if (input.status === 'PAID') update.paid_at = new Date().toISOString();
     const { data, error: updateError } = await supabase.from("brokerage_invoices").update(update).eq("id", invoice.id).select().single(); if (updateError || !data) throw updateError;
     await supabase.from("brokerage_shipments").update({ amount_invoiced: input.amount ?? invoice.amount, amount_paid: input.amount_paid ?? invoice.amount_paid, payment_status: input.status ?? invoice.status, ...(input.status === "PAID" ? { sales_status: "PAID" } : {}) }).eq("id", invoice.shipment_id);
-    await writeAudit(supabase, actor.id, "INVOICE_UPDATED", "invoice", invoice.id, { fields: Object.keys(input) }); response.json({ invoice: data });
+    await writeAudit(supabase, actor.id, "INVOICE_UPDATED", "invoice", invoice.id, { from_status: invoice.status, to_status: input.status ?? invoice.status, fields: Object.keys(input) }); response.json({ invoice: data });
   } catch (error) { next(error); }
 });
 
@@ -774,15 +856,7 @@ app.get("/api/v1/brokerage/invoices", requireBrokerageUser, async (request: Brok
     const actor = request.actor!;
     if (!(isSuper(actor) || (isOperations(actor) && actor.department_id))) return response.status(403).json({ error: "Operations access is required." });
     const supabase = adminClient();
-    let overdueQuery = supabase.from("brokerage_invoices").select("id, invoice_number, created_by, department_id").lt("due_date", new Date().toISOString().slice(0, 10)).in("status", ["DRAFT", "SENT", "PENDING"]);
-    if (!isSuper(actor)) overdueQuery = overdueQuery.eq("department_id", actor.department_id!);
-    const { data: overdue, error: overdueError } = await overdueQuery;
-    if (overdueError) throw overdueError;
-    if (overdue?.length) {
-      await supabase.from("brokerage_invoices").update({ status: "OVERDUE" }).in("id", overdue.map((invoice) => invoice.id));
-      const alerts = overdue.filter((invoice) => invoice.created_by !== actor.id).map((invoice) => ({ recipient_id: invoice.created_by, kind: "INVOICE_OVERDUE", title: "Invoice overdue", body: `${invoice.invoice_number} passed its due date.`, entity_type: "INVOICE", entity_id: invoice.id }));
-      if (alerts.length) await supabase.from("notifications").insert(alerts);
-    }
+    await markOverdueInvoices(supabase, isSuper(actor) ? undefined : actor.department_id!);
     let query = supabase.from("brokerage_invoices").select("*, brokerage_shipments(reference_number, customer_name, assigned_to)").order("updated_at", { ascending: false }).limit(200);
     if (!isSuper(actor)) query = query.eq("department_id", actor.department_id!);
     const { data, error } = await query;
@@ -901,6 +975,45 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
       row.shipments += 1;
       if (["BOOKED", "DELIVERED", "PAID"].includes(shipment.sales_status)) row.gross_generated += Number(shipment.amount_agreed ?? shipment.amount_quoted ?? 0);
     });
+    // Operations per agent: shipments, delivered, invoiced and collected (BO-7), with names instead of IDs.
+    const opsAgentIds = [...new Set(shipmentRows.map((shipment) => shipment.assigned_to).filter(Boolean))];
+    const { data: opsPeople } = opsAgentIds.length ? await supabase.from("profiles").select("id, full_name").in("id", opsAgentIds) : { data: [] as any[] };
+    const opsName = new Map((opsPeople ?? []).map((person) => [person.id, person.full_name]));
+    const invoiceByShipment = new Map(invoiceRows.map((invoice) => [invoice.shipment_id, invoice]));
+    const opsAgentRows = new Map<string, { agent_id: string | null; name: string; shipments: number; delivered: number; invoiced: number; collected: number }>();
+    for (const shipment of shipmentRows) {
+      const key = shipment.assigned_to ?? "unassigned";
+      const row = opsAgentRows.get(key) ?? { agent_id: shipment.assigned_to ?? null, name: shipment.assigned_to ? opsName.get(shipment.assigned_to) ?? "Unknown agent" : "Unassigned", shipments: 0, delivered: 0, invoiced: 0, collected: 0 };
+      row.shipments += 1;
+      if (["DELIVERED", "COMPLETED"].includes(shipment.status)) row.delivered += 1;
+      const invoice = invoiceByShipment.get(shipment.id);
+      if (invoice) { row.invoiced += Number(invoice.amount ?? 0); row.collected += Number(invoice.amount_paid ?? 0); }
+      opsAgentRows.set(key, row);
+    }
+    const opsAgents = [...opsAgentRows.values()].sort((left, right) => right.invoiced - left.invoiced);
+    const opsWorkload = Object.fromEntries(opsAgents.map((row) => [row.name, row.shipments]));
+    const opsTeamIds = [...new Set(shipmentRows.map((shipment) => shipment.team_id).filter(Boolean))];
+    const { data: opsTeams } = opsTeamIds.length ? await supabase.from("teams").select("id, name").in("id", opsTeamIds) : { data: [] as any[] };
+    const opsTeamName = new Map((opsTeams ?? []).map((team) => [team.id, team.name]));
+    const rollUp = (keyOf: (shipment: any) => string) => {
+      const rows = new Map<string, { name: string; shipments: number; delivered: number; invoiced: number; collected: number; outstanding: number }>();
+      for (const shipment of shipmentRows) {
+        const name = keyOf(shipment);
+        const row = rows.get(name) ?? { name, shipments: 0, delivered: 0, invoiced: 0, collected: 0, outstanding: 0 };
+        row.shipments += 1;
+        if (["DELIVERED", "COMPLETED"].includes(shipment.status)) row.delivered += 1;
+        const invoice = invoiceByShipment.get(shipment.id);
+        if (invoice) {
+          row.invoiced += Number(invoice.amount ?? 0);
+          row.collected += Number(invoice.amount_paid ?? 0);
+          if (invoice.status !== "CANCELLED") row.outstanding += Math.max(0, Number(invoice.amount ?? 0) - Number(invoice.amount_paid ?? 0));
+        }
+        rows.set(name, row);
+      }
+      return [...rows.values()].sort((left, right) => right.invoiced - left.invoiced);
+    };
+    const opsByTeam = rollUp((shipment) => shipment.team_id ? opsTeamName.get(shipment.team_id) ?? "Unknown team" : "No team");
+    const opsByCustomer = rollUp((shipment) => shipment.customer_name ?? "Unknown customer");
     const customerOutcomes = salesShipmentRows.reduce((totals: Record<string, number>, shipment) => {
       const label = `${shipment.customer_name} · ${shipment.sales_status}`;
       totals[label] = (totals[label] ?? 0) + 1;
@@ -925,7 +1038,10 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
       operations: {
         totals: { shipments: shipmentRows.length, quoted: sum(shipmentRows, "amount_quoted"), invoiced: sum(invoiceRows, "amount"), paid: sum(invoiceRows, "amount_paid"), outstanding: Math.max(0, sum(invoiceRows, "amount") - sum(invoiceRows, "amount_paid")) },
         shipment_statuses: tally(shipmentRows, "status"),
-        workload: tally(shipmentRows, "assigned_to"),
+        workload: opsWorkload,
+        agent_breakdown: opsAgents,
+        team_breakdown: opsByTeam,
+        customer_breakdown: opsByCustomer,
         by_team: tally(shipmentRows, "team_id"),
         by_customer: tally(shipmentRows, "customer_name"),
         invoice_statuses: tally(invoiceRows, "status"),
@@ -974,7 +1090,7 @@ app.get("/api/v1/brokerage/department-users", requireBrokerageUser, async (reque
 });
 
 app.patch("/api/v1/brokerage/department-users/:id", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
-  try { const actor = request.actor!; const userId = z.string().uuid().parse(request.params.id); const input = z.object({ is_active: z.boolean().optional() }).strict().parse(request.body); if (!isManager(actor) || !actor.department_id) return response.status(403).json({ error: "Manager access is required." }); const supabase = adminClient(); const { data: target } = await supabase.from("profiles").select("id, role").eq("id", userId).eq("department_id", actor.department_id).maybeSingle(); if (!target || target.role !== "AGENT") return response.status(404).json({ error: "Agent not found in your department." }); if (input.is_active !== undefined) { const { error } = await supabase.from("profiles").update({ is_active: input.is_active }).eq("id", userId); if (error) throw error; await writeAudit(supabase, actor.id, input.is_active ? "ACCESS_RESTORED" : "ACCESS_REVOKED", "profile", userId); } response.json({ ok: true }); } catch (error) { next(error); }
+  try { const actor = request.actor!; const userId = z.string().uuid().parse(request.params.id); const input = z.object({ is_active: z.boolean().optional() }).strict().parse(request.body); if (!isManager(actor) || !actor.department_id) return response.status(403).json({ error: "Manager access is required." }); const supabase = adminClient(); const { data: target } = await supabase.from("profiles").select("id, role").eq("id", userId).eq("department_id", actor.department_id).maybeSingle(); if (!target || target.role !== "AGENT") return response.status(404).json({ error: "Agent not found in your department." }); if (input.is_active !== undefined) { const { error } = await supabase.from("profiles").update({ is_active: input.is_active }).eq("id", userId); if (error) throw error; clearAccessCache(userId); await writeAudit(supabase, actor.id, input.is_active ? "ACCESS_RESTORED" : "ACCESS_REVOKED", "profile", userId); } response.json({ ok: true }); } catch (error) { next(error); }
 });
 
 registerPayrollRoutes(app, { adminClient, requireSuperAdmin: requireSuperAdmin as never, requireBrokerageUser: requireBrokerageUser as never, writeAudit: writeAudit as never });
@@ -996,3 +1112,8 @@ app.use((error: unknown, _request: Request, response: Response, _next: NextFunct
 });
 
 app.listen(port, () => console.log(`DEBOSS API listening on port ${port}`));
+
+// Overdue invoices are flagged hourly even when nobody opens the invoice list (IN-4).
+const overdueSweep = () => { if (!supabaseUrl || !serviceRoleKey) return; markOverdueInvoices(adminClient()).then((count) => { if (count) console.log(`Marked ${count} invoice(s) overdue.`); }).catch((error) => console.error("Overdue invoice check failed", error)); };
+setTimeout(overdueSweep, 10_000);
+setInterval(overdueSweep, 60 * 60 * 1000);
