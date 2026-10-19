@@ -863,6 +863,13 @@ app.get("/api/v1/brokerage/invoices", requireBrokerageUser, async (request: Brok
     await markOverdueInvoices(supabase, isSuper(actor) ? undefined : actor.department_id!);
     let query = supabase.from("brokerage_invoices").select("*, brokerage_shipments(reference_number, customer_name, assigned_to)").order("updated_at", { ascending: false }).limit(200);
     if (!isSuper(actor)) query = query.eq("department_id", actor.department_id!);
+    // Agents (AC-4, BO-1) see invoices only for shipments in their own scope; managers see the department (BO-6).
+    if (!isSuper(actor) && !isManager(actor)) {
+      const scope = await teamScope(actor);
+      const teams = scope.permissions.has("operations.shipments.view_team") ? scope.leadTeamIds : [];
+      const { data: own } = await supabase.from("brokerage_shipments").select("id").eq("operations_department_id", actor.department_id!).or(teams.length ? `assigned_to.eq.${actor.id},team_id.in.(${teams.join(",")})` : `assigned_to.eq.${actor.id}`);
+      query = query.in("shipment_id", (own ?? []).map((row) => row.id).concat("00000000-0000-0000-0000-000000000000"));
+    }
     const { data, error } = await query;
     if (error) throw error;
     response.json({ invoices: data ?? [] });
