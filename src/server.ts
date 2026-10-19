@@ -112,7 +112,9 @@ const documentSchema = z.object({ document_type: z.enum(["BOL", "POD", "RATE_CON
 const documentReviewSchema = z.object({ is_verified: z.boolean(), review_note: z.string().trim().max(2000).nullable().optional() });
 const commentSchema = z.object({ body: z.string().trim().min(1).max(3000) });
 const invoiceSchema = z.object({ status: z.enum(["DRAFT", "SENT", "PENDING", "PAID", "OVERDUE", "CANCELLED"]).optional(), amount: z.number().nonnegative().optional(), amount_paid: z.number().nonnegative().optional(), due_date: z.string().date().nullable().optional() });
-const fileSchema = z.object({ file_name: z.string().trim().min(1).max(180), content_type: z.enum(["application/pdf", "image/jpeg", "image/png"]) });
+/** Paperwork rules (BO-4): PDF, JPG or PNG up to 10 MB. The storage bucket enforces the same limits. */
+const MAX_DOCUMENT_BYTES = 10 * 1024 * 1024;
+const fileSchema = z.object({ file_name: z.string().trim().min(1).max(180), content_type: z.enum(["application/pdf", "image/jpeg", "image/png"], { message: "Only PDF, JPG, JPEG, and PNG files are allowed" }), file_size: z.number().int().positive().max(MAX_DOCUMENT_BYTES, { message: "File is larger than 10 MB" }).optional() });
 
 async function writeAudit(supabase: ReturnType<typeof adminClient>, actorId: string, action: string, entityType: string, entityId: string, detail: Record<string, unknown> = {}) {
   await supabase.from("audit_events").insert({ actor_id: actorId, action, entity_type: entityType, entity_id: entityId, detail });
@@ -806,6 +808,30 @@ app.patch("/api/v1/brokerage/shipments/:id", requireBrokerageUser, async (reques
     if (input.team_id) { const { data: team } = await supabase.from("teams").select("id").eq("id", input.team_id).eq("department_id", shipment.operations_department_id).eq("is_active", true).maybeSingle(); if (!team) return response.status(422).json({ error: "The team must be active in this Operations department." }); }
     if (input.exception_owner_id && !await validDepartmentPeople(shipment.operations_department_id, [input.exception_owner_id])) return response.status(422).json({ error: "The exception owner must be an active Operations Agent." });
     const { note, ...update } = input;
+    // Lifecycle rules (BO-2): one step forward or back, Exception from any active step, and out of Exception only by resolving it.
+    if (input.status && input.status !== shipment.status) {
+      const flow = ["BOOKED", "CARRIER_ASSIGNED", "PICKED_UP", "IN_TRANSIT", "DELIVERED", "COMPLETED"];
+      const from = flow.indexOf(shipment.status); const to = flow.indexOf(input.status);
+      if (input.status === "EXCEPTION") {
+        if (shipment.status === "COMPLETED") return response.status(422).json({ error: "A completed shipment cannot be put into exception." });
+        if (!(input.exception_note ?? "").trim()) return response.status(422).json({ error: "Describe what went wrong to report an exception." });
+        (update as any).exception_resolution = null;
+      } else if (shipment.status === "EXCEPTION") {
+        if (!(input.exception_resolution ?? "").trim()) return response.status(422).json({ error: "Save a resolution to move the shipment out of exception." });
+        const { data: raised } = await supabase.from("shipment_events").select("from_status").eq("shipment_id", shipment.id).eq("to_status", "EXCEPTION").order("created_at", { ascending: false }).limit(1).maybeSingle();
+        const back = raised?.from_status && raised.from_status !== "EXCEPTION" ? raised.from_status : "IN_TRANSIT";
+        if (input.status !== back) return response.status(422).json({ error: `Resolving returns the shipment to ${back.replaceAll("_", " ").toLowerCase()}.` });
+      } else {
+        if (to < 0 || from < 0 || Math.abs(to - from) !== 1) return response.status(422).json({ error: "Shipments move one step at a time through the lifecycle." });
+        if (to < from && from >= flow.indexOf("DELIVERED")) return response.status(422).json({ error: "A delivered shipment has been billed and cannot move back." });
+        if (input.status === "CARRIER_ASSIGNED" && !(input.carrier_name ?? shipment.carrier_name ?? "").trim()) return response.status(422).json({ error: "Add the carrier before marking it assigned." });
+        const today = new Date().toISOString().slice(0, 10);
+        if (input.status === "PICKED_UP" && !shipment.pickup_date && !input.pickup_date) (update as any).pickup_date = today;
+        if (input.status === "DELIVERED" && !shipment.delivery_date && !input.delivery_date) (update as any).delivery_date = today;
+      }
+    } else if (input.exception_note !== undefined && shipment.status === "EXCEPTION" && !(input.exception_note ?? "").trim()) {
+      return response.status(422).json({ error: "An open exception needs a description." });
+    }
     if (input.status === "DELIVERED" || input.status === "COMPLETED") (update as any).sales_status = "DELIVERED";
     const { data, error } = await supabase.from("brokerage_shipments").update(update).eq("id", shipment.id).select().single(); if (error) throw error;
     if (input.assigned_to !== undefined) { await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "ASSIGNED", body: input.assigned_to ?? "Unassigned" }); if (input.assigned_to && input.assigned_to !== actor.id) await supabase.from("notifications").insert({ recipient_id: input.assigned_to, kind: "SHIPMENT_ASSIGNED", title: "New shipment assignment", body: `${shipment.reference_number} is ready for your review.`, entity_type: "SHIPMENT", entity_id: shipment.id }); }
@@ -1086,7 +1112,7 @@ app.get("/api/v1/brokerage/shipments/:id/detail", requireBrokerageUser, async (r
 });
 
 app.post("/api/v1/brokerage/shipments/:id/upload-url", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
-  try { const actor = request.actor!; const input = z.object({ file_name: z.string().min(1).max(180), content_type: z.enum(["application/pdf", "image/jpeg", "image/png"]) }).parse(request.body); const supabase = adminClient(); const { data: shipment } = await supabase.from("brokerage_shipments").select("*").eq("id", z.string().uuid().parse(request.params.id)).maybeSingle(); if (!shipment) return response.status(404).json({ error: "Shipment not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id) || shipment.assigned_to === actor.id || (!!shipment.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.shipments.update_team")); if (!allowed) return response.status(403).json({ error: "Shipment is outside your update scope." }); const extension = input.file_name.split(".").pop()?.toLowerCase(); if (!extension || !["pdf", "jpg", "jpeg", "png"].includes(extension)) return response.status(422).json({ error: "Only PDF, JPG, JPEG, and PNG files are allowed." }); const path = `${actor.id}/${shipment.id}/${crypto.randomUUID()}.${extension}`; const { data, error } = await supabase.storage.from("brokerage-documents").createSignedUploadUrl(path); if (error) throw error; response.json({ path, token: data.token, signed_url: data.signedUrl }); } catch (error) { next(error); }
+  try { const actor = request.actor!; const input = fileSchema.parse(request.body); const supabase = adminClient(); const { data: shipment } = await supabase.from("brokerage_shipments").select("*").eq("id", z.string().uuid().parse(request.params.id)).maybeSingle(); if (!shipment) return response.status(404).json({ error: "Shipment not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id) || shipment.assigned_to === actor.id || (!!shipment.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.shipments.update_team")); if (!allowed) return response.status(403).json({ error: "Shipment is outside your update scope." }); const extension = input.file_name.split(".").pop()?.toLowerCase(); if (!extension || !["pdf", "jpg", "jpeg", "png"].includes(extension)) return response.status(422).json({ error: "Only PDF, JPG, JPEG, and PNG files are allowed." }); const path = `${actor.id}/${shipment.id}/${crypto.randomUUID()}.${extension}`; const { data, error } = await supabase.storage.from("brokerage-documents").createSignedUploadUrl(path); if (error) throw error; response.json({ path, token: data.token, signed_url: data.signedUrl }); } catch (error) { next(error); }
 });
 
 app.post("/api/v1/brokerage/shipments/:id/comments", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
@@ -1125,7 +1151,12 @@ app.use((error: unknown, _request: Request, response: Response, _next: NextFunct
     // Name the first problem field in plain words, e.g. "Reference number: must be at least 3 characters."
     const issue = error.issues[0];
     const field = issue?.path.length ? String(issue.path[issue.path.length - 1]).replaceAll("_", " ").replace(/^\w/, (letter) => letter.toUpperCase()) : "";
-    const detail = issue?.code === "too_small" && "minimum" in issue ? `must be at least ${issue.minimum} characters` : issue?.code === "too_big" && "maximum" in issue ? `must be at most ${issue.maximum} characters` : issue?.message?.toLowerCase() ?? "is not valid";
+    const kind = (issue as any)?.origin ?? (issue as any)?.type;
+    const unit = kind === "string" ? " characters" : "";
+    // Messages written in a schema (e.g. "File is larger than 10 MB") win over the generic wording.
+    const custom = issue?.message && !/^(too small|too big|invalid|expected|required)/i.test(issue.message) ? issue.message : undefined;
+    if (custom) return response.status(400).json({ error: `${custom}.`, issues: error.issues });
+    const detail = issue?.code === "too_small" && "minimum" in issue ? (kind === "number" && Number(issue.minimum) === 0 ? "cannot be negative" : `must be at least ${issue.minimum}${unit}`) : issue?.code === "too_big" && "maximum" in issue ? `must be at most ${issue.maximum}${unit}` : issue?.code === "invalid_type" && kind !== "string" && (issue as any).expected === "number" ? "must be a number" : issue?.message?.toLowerCase() ?? "is not valid";
     return response.status(400).json({ error: field ? `${field}: ${detail}.` : "Invalid request data.", issues: error.issues });
   }
   // Supabase returns plain objects ({ code, message, details }), not Error instances.
