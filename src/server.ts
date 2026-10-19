@@ -1060,7 +1060,23 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
       opsAgentRows.set(key, row);
     }
     const opsAgents = [...opsAgentRows.values()].sort((left, right) => right.invoiced - left.invoiced);
-    const opsWorkload = Object.fromEntries(opsAgents.map((row) => [row.name, row.shipments]));
+    // Current workload (BO-5): open shipments per agent right now, regardless of the date filter.
+    // Every active agent is listed, including those with nothing open; unassigned work is reported separately.
+    let opsWorkload: { agents: { agent_id: string; name: string; active: number; exceptions: number }[]; unassigned: number } | null = null;
+    if (isSuper(actor) || (isManager(actor) && isOperations(actor))) {
+      let agentQuery = supabase.from("profiles").select("id, full_name, department_id, departments!profiles_department_id_fkey(business_unit, function)").eq("role", "AGENT").eq("is_active", true);
+      let openQuery = supabase.from("brokerage_shipments").select("id, assigned_to, status, exception_note, exception_resolution").not("operations_department_id", "is", null).not("status", "in", "(DELIVERED,COMPLETED)");
+      if (!isSuper(actor)) { agentQuery = agentQuery.eq("department_id", actor.department_id!); openQuery = openQuery.eq("operations_department_id", actor.department_id!); }
+      const [{ data: agents }, { data: open }] = await Promise.all([agentQuery, openQuery]);
+      const opsPeopleRows = (agents ?? []).filter((person: any) => { const department = Array.isArray(person.departments) ? person.departments[0] : person.departments; return department?.business_unit === "BROKERAGE" && department?.function === "OPERATIONS"; });
+      opsWorkload = {
+        agents: opsPeopleRows.map((person: any) => {
+          const mine = (open ?? []).filter((shipment) => shipment.assigned_to === person.id);
+          return { agent_id: person.id, name: person.full_name, active: mine.length, exceptions: mine.filter(exceptionOpen).length };
+        }).sort((left, right) => right.active - left.active || left.name.localeCompare(right.name)),
+        unassigned: (open ?? []).filter((shipment) => !shipment.assigned_to).length,
+      };
+    }
     const opsTeamIds = [...new Set(shipmentRows.map((shipment) => shipment.team_id).filter(Boolean))];
     const { data: opsTeams } = opsTeamIds.length ? await supabase.from("teams").select("id, name").in("id", opsTeamIds) : { data: [] as any[] };
     const opsTeamName = new Map((opsTeams ?? []).map((team) => [team.id, team.name]));
