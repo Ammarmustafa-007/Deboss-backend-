@@ -191,6 +191,16 @@ async function withAuthorDetails(supabase: ReturnType<typeof adminClient>, rows:
   const names = new Map((authors ?? []).map((author: any) => [author.id, author.full_name]));
   return rows.map((row) => ({ ...row, author_name: names.get(row.author_id) ?? "Unknown user", can_delete: canManage || row.author_id === actorId }));
 }
+/** For shipments in Exception, the status they were at when it was raised, so progress lines hold their place. */
+async function withStatusBeforeException<T extends { id: string; status?: string | null }>(supabase: ReturnType<typeof adminClient>, rows: T[]) {
+  const stuck = rows.filter((row) => row.status === "EXCEPTION").map((row) => row.id);
+  if (!stuck.length) return rows;
+  const { data: events } = await supabase.from("shipment_events").select("shipment_id, from_status, created_at").in("shipment_id", stuck).eq("to_status", "EXCEPTION").order("created_at", { ascending: false });
+  const before = new Map<string, string>();
+  (events ?? []).forEach((event: any) => { if (!before.has(event.shipment_id) && event.from_status && event.from_status !== "EXCEPTION") before.set(event.shipment_id, event.from_status); });
+  return rows.map((row) => row.status === "EXCEPTION" ? { ...row, status_before_exception: before.get(row.id) ?? null } : row);
+}
+
 async function validDepartmentPeople(departmentId: string, ids: string[]) {
   if (!ids.length) return true;
   const { data, error } = await adminClient().from("profiles").select("id, role").eq("department_id", departmentId).eq("is_active", true).in("id", ids);
@@ -485,7 +495,7 @@ app.get("/api/v1/brokerage/customers/:id/profile", requireBrokerageUser, async (
     if (!allowed) return response.status(403).json({ error: "Customer is outside your work scope." });
     const [activities, comments, quotes, shipments] = await Promise.all([customer.lead_id ? supabase.from("lead_activities").select("*").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("record_comments").select("*").eq("entity_type", "CUSTOMER").eq("entity_id", customer.id).order("created_at", { ascending: false }), customer.lead_id ? supabase.from("sales_quotes").select("id, pickup_location, delivery_location, stage, quoted_rate, created_at").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("brokerage_shipments").select("id, quote_id, reference_number, status, sales_status, operations_department_id, pickup_location, delivery_location, equipment_type, amount_quoted, amount_agreed, pickup_date, delivery_date, created_at, updated_at, brokerage_invoices(invoice_number, status)").eq("customer_id", customer.id).order("created_at", { ascending: false })]);
     const canManage = isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id);
-    response.json({ customer, can_edit: canAccessSalesCustomer(actor, customer, lead, scope, true), activities: await withAuthorDetails(supabase, activities.data ?? [], actor.id, canManage), comments: await withAuthorDetails(supabase, comments.data ?? [], actor.id, canManage), quotes: quotes.data ?? [], shipments: shipments.data ?? [] });
+    response.json({ customer, can_edit: canAccessSalesCustomer(actor, customer, lead, scope, true), activities: await withAuthorDetails(supabase, activities.data ?? [], actor.id, canManage), comments: await withAuthorDetails(supabase, comments.data ?? [], actor.id, canManage), quotes: quotes.data ?? [], shipments: await withStatusBeforeException(supabase, (shipments.data ?? []) as any[]) });
   } catch (error) { next(error); }
 });
 
@@ -607,6 +617,8 @@ app.patch("/api/v1/brokerage/sales-shipments/:id", requireBrokerageUser, async (
     const update: Record<string, unknown> = { ...shipmentInput };
     if (quoted_rate !== undefined) update.amount_quoted = quoted_rate;
     if (agreed_rate !== undefined) update.amount_agreed = agreed_rate;
+    // After handoff, Operations drives this status (delivered on delivery, paid when the invoice is paid), like a converted lead's stage.
+    if (status !== undefined && status !== shipment.sales_status && shipment.operations_department_id) return response.status(422).json({ error: "This shipment is with Operations, so its status now follows their progress." });
     if (status !== undefined) update.sales_status = status;
     const { data, error } = await supabase.from("brokerage_shipments").update(update).eq("id", shipment.id).select().single();
     if (error || !data) throw error;
