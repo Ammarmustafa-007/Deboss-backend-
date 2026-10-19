@@ -265,7 +265,7 @@ app.get("/api/v1/brokerage/workspace", requireBrokerageUser, async (request: Bro
       const customerIds = (salesCustomers ?? []).map((customer: any) => customer.id);
       shipmentQuery = customerIds.length ? shipmentQuery.in("customer_id", customerIds) : shipmentQuery.eq("id", "00000000-0000-0000-0000-000000000000");
     } else {
-      if (!departmentManager && actor.role !== "SUPER_ADMIN") shipmentQuery = teamScope ? shipmentQuery.in("team_id", leadTeams) : shipmentQuery.eq("assigned_to", actor.id);
+      if (!departmentManager && actor.role !== "SUPER_ADMIN") shipmentQuery = teamScope ? shipmentQuery.or(`assigned_to.eq.${actor.id},team_id.in.(${leadTeams.join(",")})`) : shipmentQuery.eq("assigned_to", actor.id);
       if (actor.department_id && actor.role !== "SUPER_ADMIN") shipmentQuery = shipmentQuery.eq("operations_department_id", actor.department_id);
     }
     const [{ data: shipments }, { data: quotes }] = await Promise.all([shipmentQuery, sales && leadIds.length ? supabase.from("sales_quotes").select("*").in("lead_id", leadIds).order("updated_at", { ascending: false }) : Promise.resolve({ data: [] })]);
@@ -928,7 +928,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
     if (!isSuper(actor)) {
       if (isOperations(actor)) {
         shipmentQuery = shipmentQuery.eq("operations_department_id", actor.department_id!);
-        if (!isManager(actor)) shipmentQuery = scope.permissions.has("operations.reports.view_team") && scope.leadTeamIds.length ? shipmentQuery.in("team_id", scope.leadTeamIds) : shipmentQuery.eq("assigned_to", actor.id);
+        if (!isManager(actor)) shipmentQuery = scope.permissions.has("operations.reports.view_team") && scope.leadTeamIds.length ? shipmentQuery.or(`assigned_to.eq.${actor.id},team_id.in.(${scope.leadTeamIds.join(",")})`) : shipmentQuery.eq("assigned_to", actor.id);
       } else shipmentQuery = shipmentQuery.eq("id", "00000000-0000-0000-0000-000000000000");
     }
     if (range.from) shipmentQuery = shipmentQuery.gte("created_at", `${range.from}T00:00:00.000Z`);
