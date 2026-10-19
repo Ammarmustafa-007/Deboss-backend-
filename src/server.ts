@@ -947,7 +947,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
     const shipmentRows = shipments ?? [];
     const invoiceRows = invoices ?? [];
     const commercialValue = (rows: any[]) => rows.reduce((total, row) => total + Number(row.amount_agreed ?? row.amount_quoted ?? 0), 0);
-    const ownerIds = [...new Set(leadRows.map((lead) => lead.owner_id).filter(Boolean))];
+    const ownerIds = [...new Set([...leadRows.map((lead) => lead.owner_id), ...(salesCustomers ?? []).map((customer) => customer.owner_id)].filter(Boolean))];
     const { data: owners } = ownerIds.length ? await supabase.from("profiles").select("id, full_name").in("id", ownerIds) : { data: [] as any[] };
     const ownerNames = new Map((owners ?? []).map((owner) => [owner.id, owner.full_name]));
     const salesByAgent = leadRows.reduce((totals: Record<string, number>, lead) => {
@@ -978,6 +978,17 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
       const row = agentRow(owner);
       row.shipments += 1;
       if (["BOOKED", "DELIVERED", "PAID"].includes(shipment.sales_status)) row.gross_generated += Number(shipment.amount_agreed ?? shipment.amount_quoted ?? 0);
+    });
+    // Outcome per customer, grouped by the customer's owning agent (BS-7).
+    const outcomeRows = new Map<string, { agent_id: string | null; agent: string; customer: string; opportunities: number; statuses: Record<string, number>; gross_generated: number }>();
+    salesShipmentRows.forEach((shipment) => {
+      const owner = customerOwner.get(shipment.customer_id) ?? null;
+      const key = `${owner ?? "none"}:${shipment.customer_id}`;
+      const row = outcomeRows.get(key) ?? { agent_id: owner, agent: owner ? ownerNames.get(owner) ?? "Unknown agent" : "Unassigned", customer: shipment.customer_name ?? "Unknown customer", opportunities: 0, statuses: {} as Record<string, number>, gross_generated: 0 };
+      row.opportunities += 1;
+      row.statuses[shipment.sales_status] = (row.statuses[shipment.sales_status] ?? 0) + 1;
+      if (["BOOKED", "DELIVERED", "PAID"].includes(shipment.sales_status)) row.gross_generated += Number(shipment.amount_agreed ?? shipment.amount_quoted ?? 0);
+      outcomeRows.set(key, row);
     });
     // Operations per agent: shipments, delivered, invoiced and collected (BO-7), with names instead of IDs.
     const opsAgentIds = [...new Set(shipmentRows.map((shipment) => shipment.assigned_to).filter(Boolean))];
@@ -1031,6 +1042,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
         quote_stages: tally(quoteRows, "stage"),
         shipment_statuses: tally(salesShipmentRows, "sales_status"),
         customer_outcomes: customerOutcomes,
+        agent_outcomes: [...outcomeRows.values()].sort((left, right) => left.agent.localeCompare(right.agent) || right.gross_generated - left.gross_generated),
         by_agent: salesByAgent,
         by_team: salesByTeam,
         agent_breakdown: [...agentRows.values()].sort((left, right) => right.gross_generated - left.gross_generated),
