@@ -137,8 +137,11 @@ async function ensureInvoice(supabase: ReturnType<typeof adminClient>, shipment:
  * Flags unpaid invoices past their due date as Overdue (IN-4), audits the change (IN-5) and notifies the
  * invoice creator and the department's Operations managers. Runs on a schedule and when invoices are listed.
  */
+/** Allowed manual invoice moves. Overdue is applied by the system once a sent invoice passes its due date. */
+const INVOICE_FLOW: Record<string, string[]> = { DRAFT: ["SENT", "CANCELLED"], SENT: ["PENDING", "PAID", "CANCELLED"], PENDING: ["PAID", "CANCELLED"], OVERDUE: ["PENDING", "PAID", "CANCELLED"], PAID: [], CANCELLED: [] };
+
 async function markOverdueInvoices(supabase: ReturnType<typeof adminClient>, departmentId?: string) {
-  let overdueQuery = supabase.from("brokerage_invoices").select("id, invoice_number, status, created_by, department_id").lt("due_date", new Date().toISOString().slice(0, 10)).in("status", ["DRAFT", "SENT", "PENDING"]);
+  let overdueQuery = supabase.from("brokerage_invoices").select("id, invoice_number, status, created_by, department_id").lt("due_date", new Date().toISOString().slice(0, 10)).in("status", ["SENT", "PENDING"]);
   if (departmentId) overdueQuery = overdueQuery.eq("department_id", departmentId);
   const { data: overdue, error } = await overdueQuery;
   if (error) throw error;
@@ -886,6 +889,8 @@ app.patch("/api/v1/brokerage/invoices/:id", requireBrokerageUser, async (request
     const { data: invoice, error } = await supabase.from("brokerage_invoices").select("*, brokerage_shipments(operations_department_id)").eq("id", invoiceId).single();
     if (error || !invoice) return response.status(404).json({ error: "Invoice not found." }); const shipment: any = Array.isArray((invoice as any).brokerage_shipments) ? (invoice as any).brokerage_shipments[0] : (invoice as any).brokerage_shipments;
     if (!(isSuper(actor) || (isManager(actor) && actor.department_id === shipment?.operations_department_id))) return response.status(403).json({ error: "Only the Operations Manager can update an invoice." });
+    // Invoice lifecycle (IN-1, BO-6): it must be Sent before it can be pending or paid; Overdue is set automatically.
+    if (input.status && input.status !== invoice.status && !(INVOICE_FLOW[invoice.status] ?? []).includes(input.status)) return response.status(422).json({ error: invoice.status === "DRAFT" && ["PENDING", "PAID"].includes(input.status) ? "Mark the invoice as Sent first." : `An invoice can't move from ${invoice.status.toLowerCase()} to ${input.status.toLowerCase()}.` });
     const update: Record<string, unknown> = { ...input }; if (input.status === 'PAID') update.paid_at = new Date().toISOString();
     // Paid means fully collected: fill the paid amount when it's left out, refuse a partial one (IN-3).
     if (input.status === "PAID") {
