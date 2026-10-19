@@ -355,6 +355,10 @@ app.patch("/api/v1/brokerage/leads/:id", requireBrokerageUser, async (request: B
     const scope = await teamScope(actor); const teamEditor = !!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team");
     if (!(isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || teamEditor)) return response.status(403).json({ error: "You do not have permission to edit this lead." });
     if (input.stage === "CUSTOMER") return response.status(422).json({ error: "Customer stage is set when you convert the lead to a customer profile." });
+    if (input.stage !== undefined) {
+      const [{ count: customers }, { count: quotes }] = await Promise.all([supabase.from("brokerage_customers").select("id", { count: "exact", head: true }).eq("lead_id", lead.id), supabase.from("sales_quotes").select("id", { count: "exact", head: true }).eq("lead_id", lead.id)]);
+      if (lead.stage === "CUSTOMER" || customers || quotes) return response.status(422).json({ error: "This lead has a customer or quote, so its stage follows its quotes and shipments and cannot be changed." });
+    }
     if ((input.owner_id || input.team_id !== undefined) && !(isSuper(actor) || isManager(actor) || scope.permissions.has("sales.leads.assign"))) return response.status(403).json({ error: "Lead assignment permission is required." });
     if (input.owner_id && !await validDepartmentPeople(lead.department_id, [input.owner_id])) return response.status(422).json({ error: "The lead owner must be an active Sales Agent in this department." });
     if (input.team_id) { const { data: team } = await supabase.from("teams").select("id").eq("id", input.team_id).eq("department_id", lead.department_id).eq("is_active", true).maybeSingle(); if (!team) return response.status(422).json({ error: "The team must be active in this Sales department." }); }
