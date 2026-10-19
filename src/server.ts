@@ -887,6 +887,12 @@ app.patch("/api/v1/brokerage/invoices/:id", requireBrokerageUser, async (request
     if (error || !invoice) return response.status(404).json({ error: "Invoice not found." }); const shipment: any = Array.isArray((invoice as any).brokerage_shipments) ? (invoice as any).brokerage_shipments[0] : (invoice as any).brokerage_shipments;
     if (!(isSuper(actor) || (isManager(actor) && actor.department_id === shipment?.operations_department_id))) return response.status(403).json({ error: "Only the Operations Manager can update an invoice." });
     const update: Record<string, unknown> = { ...input }; if (input.status === 'PAID') update.paid_at = new Date().toISOString();
+    // Paid means fully collected: fill the paid amount when it's left out, refuse a partial one (IN-3).
+    if (input.status === "PAID") {
+      const amount = Number(input.amount ?? invoice.amount ?? 0);
+      if (input.amount_paid === undefined || input.amount_paid === null) { update.amount_paid = amount; input.amount_paid = amount; }
+      else if (Number(input.amount_paid) < amount) return response.status(422).json({ error: "Paid needs the full amount collected. Use Pending for a partial payment." });
+    }
     const { data, error: updateError } = await supabase.from("brokerage_invoices").update(update).eq("id", invoice.id).select().single(); if (updateError || !data) throw updateError;
     await supabase.from("brokerage_shipments").update({ amount_invoiced: input.amount ?? invoice.amount, amount_paid: input.amount_paid ?? invoice.amount_paid, payment_status: input.status ?? invoice.status, ...(input.status === "PAID" ? { sales_status: "PAID" } : {}) }).eq("id", invoice.shipment_id);
     await writeAudit(supabase, actor.id, "INVOICE_UPDATED", "invoice", invoice.id, { from_status: invoice.status, to_status: input.status ?? invoice.status, fields: Object.keys(input) }); response.json({ invoice: data });
@@ -969,7 +975,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
     const { data: salesShipments, error: salesShipmentError } = await salesShipmentQuery;
     if (salesShipmentError) throw salesShipmentError;
 
-    let shipmentQuery = supabase.from("brokerage_shipments").select("id, status, assigned_to, team_id, customer_name, invoice_ready, exception_note, amount_quoted, amount_invoiced, amount_paid, payment_status, created_at").order("created_at", { ascending: false }).limit(1000);
+    let shipmentQuery = supabase.from("brokerage_shipments").select("id, reference_number, status, assigned_to, team_id, customer_name, pickup_location, delivery_location, equipment_type, carrier_name, pickup_date, delivery_date, invoice_ready, exception_note, exception_resolution, amount_quoted, amount_agreed, amount_invoiced, amount_paid, payment_status, created_at, updated_at").order("created_at", { ascending: false }).limit(1000);
     if (!isSuper(actor)) {
       if (isOperations(actor)) {
         shipmentQuery = shipmentQuery.eq("operations_department_id", actor.department_id!);
@@ -982,7 +988,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
     if (shipmentError) throw shipmentError;
     const shipmentIds = (shipments ?? []).map((shipment) => shipment.id);
     const { data: invoices, error: invoiceError } = shipmentIds.length
-      ? await supabase.from("brokerage_invoices").select("id, shipment_id, amount, amount_paid, status, due_date, created_at").in("shipment_id", shipmentIds)
+      ? await supabase.from("brokerage_invoices").select("id, invoice_number, shipment_id, amount, amount_paid, status, due_date, paid_at, created_at").in("shipment_id", shipmentIds)
       : { data: [] as any[], error: null };
     if (invoiceError) throw invoiceError;
 
@@ -1040,14 +1046,17 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
     const { data: opsPeople } = opsAgentIds.length ? await supabase.from("profiles").select("id, full_name").in("id", opsAgentIds) : { data: [] as any[] };
     const opsName = new Map((opsPeople ?? []).map((person) => [person.id, person.full_name]));
     const invoiceByShipment = new Map(invoiceRows.map((invoice) => [invoice.shipment_id, invoice]));
-    const opsAgentRows = new Map<string, { agent_id: string | null; name: string; shipments: number; delivered: number; invoiced: number; collected: number }>();
+    const exceptionOpen = (shipment: any) => shipment.status === "EXCEPTION" || Boolean(shipment.exception_note && !shipment.exception_resolution);
+    const owed = (invoice: any) => invoice && invoice.status !== "CANCELLED" ? Math.max(0, Number(invoice.amount ?? 0) - Number(invoice.amount_paid ?? 0)) : 0;
+    const opsAgentRows = new Map<string, { agent_id: string | null; name: string; shipments: number; in_progress: number; delivered: number; exceptions: number; invoiced: number; collected: number; outstanding: number }>();
     for (const shipment of shipmentRows) {
       const key = shipment.assigned_to ?? "unassigned";
-      const row = opsAgentRows.get(key) ?? { agent_id: shipment.assigned_to ?? null, name: shipment.assigned_to ? opsName.get(shipment.assigned_to) ?? "Unknown agent" : "Unassigned", shipments: 0, delivered: 0, invoiced: 0, collected: 0 };
+      const row = opsAgentRows.get(key) ?? { agent_id: shipment.assigned_to ?? null, name: shipment.assigned_to ? opsName.get(shipment.assigned_to) ?? "Unknown agent" : "Unassigned", shipments: 0, in_progress: 0, delivered: 0, exceptions: 0, invoiced: 0, collected: 0, outstanding: 0 };
       row.shipments += 1;
-      if (["DELIVERED", "COMPLETED"].includes(shipment.status)) row.delivered += 1;
+      if (["DELIVERED", "COMPLETED"].includes(shipment.status)) row.delivered += 1; else row.in_progress += 1;
+      if (exceptionOpen(shipment)) row.exceptions += 1;
       const invoice = invoiceByShipment.get(shipment.id);
-      if (invoice) { row.invoiced += Number(invoice.amount ?? 0); row.collected += Number(invoice.amount_paid ?? 0); }
+      if (invoice) { row.invoiced += Number(invoice.amount ?? 0); row.collected += Number(invoice.amount_paid ?? 0); row.outstanding += owed(invoice); }
       opsAgentRows.set(key, row);
     }
     const opsAgents = [...opsAgentRows.values()].sort((left, right) => right.invoiced - left.invoiced);
@@ -1066,7 +1075,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
         if (invoice) {
           row.invoiced += Number(invoice.amount ?? 0);
           row.collected += Number(invoice.amount_paid ?? 0);
-          if (invoice.status !== "CANCELLED") row.outstanding += Math.max(0, Number(invoice.amount ?? 0) - Number(invoice.amount_paid ?? 0));
+          row.outstanding += owed(invoice);
         }
         rows.set(name, row);
       }
@@ -1074,6 +1083,23 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
     };
     const opsByTeam = rollUp((shipment) => shipment.team_id ? opsTeamName.get(shipment.team_id) ?? "Unknown team" : "No team");
     const opsByCustomer = rollUp((shipment) => shipment.customer_name ?? "Unknown customer");
+    // One complete line per shipment for the on-screen table and CSV (BO-1 to BO-7, IN-6): names, not IDs.
+    const today = new Date().toISOString().slice(0, 10);
+    const opsDetail = shipmentRows.map((shipment) => {
+      const invoice = invoiceByShipment.get(shipment.id);
+      return {
+        id: shipment.id, reference_number: shipment.reference_number, customer_name: shipment.customer_name ?? null,
+        pickup_location: shipment.pickup_location, delivery_location: shipment.delivery_location, equipment_type: shipment.equipment_type ?? null,
+        agent: shipment.assigned_to ? opsName.get(shipment.assigned_to) ?? "Unknown agent" : "Unassigned", team: shipment.team_id ? opsTeamName.get(shipment.team_id) ?? "Unknown team" : null,
+        status: shipment.status, carrier_name: shipment.carrier_name ?? null, pickup_date: shipment.pickup_date ?? null, delivery_date: shipment.delivery_date ?? null,
+        amount_quoted: shipment.amount_quoted ?? null, amount_agreed: shipment.amount_agreed ?? null,
+        invoice_number: invoice?.invoice_number ?? null, invoice_status: invoice?.status ?? null, invoice_due: invoice?.due_date ?? null,
+        invoiced: invoice ? Number(invoice.amount ?? 0) : null, collected: invoice ? Number(invoice.amount_paid ?? 0) : null, outstanding: invoice ? owed(invoice) : null,
+        overdue: Boolean(invoice && owed(invoice) > 0 && invoice.due_date && invoice.due_date < today),
+        exception: exceptionOpen(shipment) ? "Open" : shipment.exception_resolution ? "Resolved" : null,
+        created_at: shipment.created_at, updated_at: shipment.updated_at,
+      };
+    });
     const customerOutcomes = salesShipmentRows.reduce((totals: Record<string, number>, shipment) => {
       const label = `${shipment.customer_name} · ${shipment.sales_status}`;
       totals[label] = (totals[label] ?? 0) + 1;
@@ -1097,7 +1123,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
         agents: (owners ?? []).sort((left, right) => left.full_name.localeCompare(right.full_name))
       },
       operations: {
-        totals: { shipments: shipmentRows.length, quoted: sum(shipmentRows, "amount_quoted"), invoiced: sum(invoiceRows, "amount"), paid: sum(invoiceRows, "amount_paid"), outstanding: Math.max(0, sum(invoiceRows, "amount") - sum(invoiceRows, "amount_paid")) },
+        totals: { shipments: shipmentRows.length, in_progress: shipmentRows.filter((row) => !["DELIVERED", "COMPLETED"].includes(row.status)).length, delivered: shipmentRows.filter((row) => ["DELIVERED", "COMPLETED"].includes(row.status)).length, exceptions: shipmentRows.filter(exceptionOpen).length, quoted: sum(shipmentRows, "amount_quoted"), invoiced: sum(invoiceRows, "amount"), paid: sum(invoiceRows, "amount_paid"), outstanding: invoiceRows.reduce((total, invoice) => total + owed(invoice), 0), overdue: opsDetail.filter((row) => row.overdue).length },
         shipment_statuses: tally(shipmentRows, "status"),
         workload: opsWorkload,
         agent_breakdown: opsAgents,
@@ -1107,8 +1133,8 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
         by_customer: tally(shipmentRows, "customer_name"),
         invoice_statuses: tally(invoiceRows, "status"),
         invoice_ready: shipmentRows.filter((row) => row.invoice_ready).length,
-        exceptions: shipmentRows.filter((row) => row.exception_note).length,
-        rows: shipmentRows,
+        exceptions: shipmentRows.filter(exceptionOpen).length,
+        rows: opsDetail,
         invoices: invoiceRows
       }
     });
