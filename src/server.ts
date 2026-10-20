@@ -974,8 +974,9 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
   try {
     const actor = request.actor!;
     const range = z.object({ from: z.string().date().optional(), to: z.string().date().optional(), agent_id: z.string().uuid().optional() }).parse(request.query);
-    if (range.agent_id && !isSuper(actor) && !isManager(actor)) return response.status(403).json({ error: "Only a manager can open an individual agent report." });
     const scope = await teamScope(actor);
+    // Managers open any agent in their department; a Team Lead opens their own team's members (or themselves).
+    if (range.agent_id && !isSuper(actor) && !isManager(actor) && range.agent_id !== actor.id && !scope.memberIds.includes(range.agent_id)) return response.status(403).json({ error: "You can open individual reports only for your team's members." });
     const supabase = adminClient();
     const tally = (rows: any[], field: string) => rows.reduce((total: Record<string, number>, row: any) => {
       const value = row[field] ?? "UNASSIGNED";
@@ -1020,6 +1021,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
         if (!isManager(actor)) shipmentQuery = scope.permissions.has("operations.reports.view_team") && scope.leadTeamIds.length ? shipmentQuery.or(`assigned_to.eq.${actor.id},${teamFilter(scope, "assigned_to")}`) : shipmentQuery.eq("assigned_to", actor.id);
       } else shipmentQuery = shipmentQuery.eq("id", "00000000-0000-0000-0000-000000000000");
     }
+    if (range.agent_id) shipmentQuery = shipmentQuery.eq("assigned_to", range.agent_id);
     if (range.from) shipmentQuery = shipmentQuery.gte("created_at", `${range.from}T00:00:00.000Z`);
     if (range.to) shipmentQuery = shipmentQuery.lte("created_at", `${range.to}T23:59:59.999Z`);
     const { data: shipments, error: shipmentError } = await shipmentQuery;
