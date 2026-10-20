@@ -46,7 +46,7 @@ async function verifiedUserId(token: string) {
 const CACHE_MS = 30_000;
 type CachedProfile = { id: string; role: string; department_id: string | null; is_active: boolean; department: { business_unit: string; function: string } | null };
 const profileCache = new Map<string, { value: CachedProfile | null; expires: number }>();
-const teamScopeCache = new Map<string, { value: { teamIds: string[]; leadTeamIds: string[]; permissions: Set<string> }; expires: number }>();
+const teamScopeCache = new Map<string, { value: { teamIds: string[]; leadTeamIds: string[]; memberIds: string[]; permissions: Set<string> }; expires: number }>();
 function clearAccessCache(userId?: string) {
   if (userId) profileCache.delete(userId); else profileCache.clear();
   teamScopeCache.clear();
@@ -162,7 +162,7 @@ async function markOverdueInvoices(supabase: ReturnType<typeof adminClient>, dep
 
 async function teamScope(actor: BrokerageRequest["actor"]) {
   const supabase = adminClient();
-  if (!actor) return { teamIds: [] as string[], leadTeamIds: [] as string[], permissions: new Set<string>() };
+  if (!actor) return { teamIds: [] as string[], leadTeamIds: [] as string[], memberIds: [] as string[], permissions: new Set<string>() };
   const hit = teamScopeCache.get(actor.id);
   if (hit && hit.expires > Date.now()) return hit.value;
   const { data: memberships } = await supabase.from("team_members").select("team_id, teams(team_lead_id, is_active)").eq("user_id", actor.id);
@@ -170,9 +170,22 @@ async function teamScope(actor: BrokerageRequest["actor"]) {
   const leadTeamIds = (memberships ?? []).filter((row: any) => { const team = Array.isArray(row.teams) ? row.teams[0] : row.teams; return team?.is_active && team.team_lead_id === actor.id; }).map((row: any) => row.team_id);
   // Delegated Team Lead permissions only apply while the actor is the selected lead.
   const { data: grants } = leadTeamIds.length ? await supabase.from("team_lead_permissions").select("permission_key").eq("user_id", actor.id).in("team_id", leadTeamIds) : { data: [] as any[] };
-  const value = { teamIds, leadTeamIds, permissions: new Set((grants ?? []).map((row: any) => row.permission_key)) };
+  // A team's work is what is tagged with the team or owned/assigned to one of its members.
+  const { data: members } = leadTeamIds.length ? await supabase.from("team_members").select("user_id").in("team_id", leadTeamIds) : { data: [] as any[] };
+  const memberIds = [...new Set((members ?? []).map((row: any) => row.user_id as string))];
+  const value = { teamIds, leadTeamIds, memberIds, permissions: new Set((grants ?? []).map((row: any) => row.permission_key)) };
   teamScopeCache.set(actor.id, { value, expires: Date.now() + CACHE_MS });
   return value;
+}
+type TeamScope = Awaited<ReturnType<typeof teamScope>>;
+/** True when a record belongs to one of the Team Lead's teams: tagged with the team, or owned/assigned to a member. */
+function inTeam(scope: TeamScope, teamId?: string | null, personId?: string | null) {
+  return Boolean((teamId && scope.leadTeamIds.includes(teamId)) || (personId && scope.memberIds.includes(personId)));
+}
+/** PostgREST filter for the same rule, for list queries. */
+function teamFilter(scope: TeamScope, personColumn: string) {
+  const parts = [scope.leadTeamIds.length ? `team_id.in.(${scope.leadTeamIds.join(",")})` : "", scope.memberIds.length ? `${personColumn}.in.(${scope.memberIds.join(",")})` : ""].filter(Boolean);
+  return parts.join(",") || "id.is.null";
 }
 function isManager(actor: BrokerageRequest["actor"]) { return actor?.role === "MANAGER"; }
 function isSuper(actor: BrokerageRequest["actor"]) { return actor?.role === "SUPER_ADMIN"; }
@@ -184,7 +197,7 @@ function canAccessSalesCustomer(actor: BrokerageRequest["actor"], customer: any,
   if (isManager(actor) && actor.department_id === customer.sales_department_id) return true;
   if (customer.owner_id === actor.id) return true;
   const permission = edit ? "sales.leads.edit_team" : "sales.leads.view_team";
-  return Boolean(lead?.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has(permission));
+  return Boolean(inTeam(scope, lead?.team_id, lead?.owner_id) && scope.permissions.has(permission));
 }
 async function withAuthorDetails(supabase: ReturnType<typeof adminClient>, rows: any[], actorId: string, canManage = false) {
   const authorIds = [...new Set(rows.map((row) => row.author_id).filter(Boolean))];
@@ -261,16 +274,13 @@ app.get("/api/v1/brokerage/workspace", requireBrokerageUser, async (request: Bro
     const actor = request.actor!;
     if (actor.role !== "SUPER_ADMIN" && actor.department?.business_unit !== "BROKERAGE") return response.status(403).json({ error: "Brokerage access is required." });
     const supabase = adminClient();
-    const { data: memberships } = await supabase.from("team_members").select("team_id, teams(id, name, team_lead_id, department_id, is_active)").eq("user_id", actor.id);
-    const teamIds = (memberships ?? []).map((member) => member.team_id);
-    const leadTeams = (memberships ?? []).filter((member) => { const team = Array.isArray(member.teams) ? member.teams[0] : member.teams; return team?.is_active && team.team_lead_id === actor.id; }).map((member) => member.team_id);
-    const { data: grants } = await supabase.from("team_lead_permissions").select("permission_key").eq("user_id", actor.id).in("team_id", leadTeams.length ? leadTeams : ["00000000-0000-0000-0000-000000000000"]);
-    const permissions = new Set((grants ?? []).map((grant) => grant.permission_key));
+    const scope = await teamScope(actor);
+    const { teamIds, leadTeamIds: leadTeams, permissions } = scope;
     const departmentManager = actor.role === "MANAGER";
     const sales = actor.department?.function === "SALES";
-    const teamScope = leadTeams.length && (permissions.has("sales.leads.view_team") || permissions.has("operations.shipments.view_team"));
+    const teamView = leadTeams.length && (permissions.has("sales.leads.view_team") || permissions.has("operations.shipments.view_team"));
     let leadQuery = supabase.from("sales_leads").select("*").order("updated_at", { ascending: false }).limit(100);
-    if (!departmentManager && actor.role !== "SUPER_ADMIN") leadQuery = teamScope && sales ? leadQuery.in("team_id", leadTeams) : leadQuery.eq("owner_id", actor.id);
+    if (!departmentManager && actor.role !== "SUPER_ADMIN") leadQuery = teamView && sales ? leadQuery.or(`owner_id.eq.${actor.id},${teamFilter(scope, "owner_id")}`) : leadQuery.eq("owner_id", actor.id);
     if (actor.department_id && actor.role !== "SUPER_ADMIN") leadQuery = leadQuery.eq("department_id", actor.department_id);
     const [{ data: leads }, { data: teams }, { data: operationsDepartments }] = await Promise.all([leadQuery, supabase.from("teams").select("id, name, team_lead_id").eq("department_id", actor.department_id ?? "00000000-0000-0000-0000-000000000000"), sales ? supabase.from("departments").select("id, name").eq("business_unit", "BROKERAGE").eq("function", "OPERATIONS").eq("is_active", true).order("name") : Promise.resolve({ data: [] })]);
     const leadIds = (leads ?? []).map((lead: any) => lead.id);
@@ -280,7 +290,7 @@ app.get("/api/v1/brokerage/workspace", requireBrokerageUser, async (request: Bro
       const customerIds = (salesCustomers ?? []).map((customer: any) => customer.id);
       shipmentQuery = customerIds.length ? shipmentQuery.in("customer_id", customerIds) : shipmentQuery.eq("id", "00000000-0000-0000-0000-000000000000");
     } else {
-      if (!departmentManager && actor.role !== "SUPER_ADMIN") shipmentQuery = teamScope ? shipmentQuery.or(`assigned_to.eq.${actor.id},team_id.in.(${leadTeams.join(",")})`) : shipmentQuery.eq("assigned_to", actor.id);
+      if (!departmentManager && actor.role !== "SUPER_ADMIN") shipmentQuery = teamView ? shipmentQuery.or(`assigned_to.eq.${actor.id},${teamFilter(scope, "assigned_to")}`) : shipmentQuery.eq("assigned_to", actor.id);
       if (actor.department_id && actor.role !== "SUPER_ADMIN") shipmentQuery = shipmentQuery.eq("operations_department_id", actor.department_id);
     }
     const [{ data: shipments }, { data: quotes }] = await Promise.all([shipmentQuery, sales && leadIds.length ? supabase.from("sales_quotes").select("*").in("lead_id", leadIds).order("updated_at", { ascending: false }) : Promise.resolve({ data: [] })]);
@@ -304,7 +314,7 @@ app.post("/api/v1/brokerage/quotes", requireBrokerageUser, async (request: Broke
     const actor = request.actor!; const input = quoteSchema.parse(request.body);
     if (actor.department?.function !== "SALES") return response.status(403).json({ error: "Only Brokerage Sales users can create quotes." });
     const { data: lead } = await adminClient().from("sales_leads").select("id, department_id, owner_id, team_id").eq("id", input.lead_id).maybeSingle();
-    const scope = await teamScope(actor); const accessible = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (!!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.view_team")));
+    const scope = await teamScope(actor); const accessible = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.view_team")));
     if (!accessible) return response.status(403).json({ error: "You cannot create a quote for this lead." });
     const { data, error } = await adminClient().from("sales_quotes").insert({ ...input, created_by: actor.id }).select().single();
     if (error) throw error; await writeAudit(adminClient(), actor.id, "QUOTE_CREATED", "quote", data.id, { lead_id: input.lead_id }); response.status(201).json({ quote: data });
@@ -367,7 +377,7 @@ app.patch("/api/v1/brokerage/leads/:id", requireBrokerageUser, async (request: B
     const actor = request.actor!; const input = leadUpdateSchema.parse(request.body); const supabase = adminClient();
     const { data: lead, error: leadError } = await supabase.from("sales_leads").select("*").eq("id", z.string().uuid().parse(request.params.id)).single();
     if (leadError || !lead) return response.status(404).json({ error: "Lead not found." });
-    const scope = await teamScope(actor); const teamEditor = !!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team");
+    const scope = await teamScope(actor); const teamEditor = inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.edit_team");
     if (!(isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || teamEditor)) return response.status(403).json({ error: "You do not have permission to edit this lead." });
     if (input.stage === "CUSTOMER") return response.status(422).json({ error: "Customer stage is set when you convert the lead to a customer profile." });
     if (input.stage !== undefined) {
@@ -400,7 +410,7 @@ app.post("/api/v1/brokerage/leads/:id/activities", requireBrokerageUser, async (
     const actor = request.actor!; const input = activitySchema.parse(request.body); const supabase = adminClient();
     const { data: lead, error: leadError } = await supabase.from("sales_leads").select("id, owner_id, team_id, department_id").eq("id", z.string().uuid().parse(request.params.id)).single();
     if (leadError || !lead) return response.status(404).json({ error: "Lead not found." });
-    const scope = await teamScope(actor); const teamEditor = !!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && (scope.permissions.has("sales.leads.edit_team") || scope.permissions.has("sales.activities.assign"));
+    const scope = await teamScope(actor); const teamEditor = inTeam(scope, lead.team_id, lead.owner_id) && (scope.permissions.has("sales.leads.edit_team") || scope.permissions.has("sales.activities.assign"));
     if (!(isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || teamEditor)) return response.status(403).json({ error: "You do not have permission to add activity to this lead." });
     const { data, error } = await supabase.from("lead_activities").insert({ ...input, lead_id: lead.id, author_id: actor.id }).select().single();
     if (error) throw error; await writeAudit(supabase, actor.id, "LEAD_ACTIVITY_ADDED", "lead", lead.id, { type: input.activity_type }); response.status(201).json({ activity: data });
@@ -414,7 +424,7 @@ app.patch("/api/v1/brokerage/activities/:id", requireBrokerageUser, async (reque
     if (activityError || !activity) return response.status(404).json({ error: "Activity not found." });
     const { data: lead } = await supabase.from("sales_leads").select("id, owner_id, team_id, department_id").eq("id", activity.lead_id).maybeSingle();
     if (!lead) return response.status(404).json({ error: "Lead not found." });
-    const scope = await teamScope(actor); const teamEditor = !!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team");
+    const scope = await teamScope(actor); const teamEditor = inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.edit_team");
     if (!(activity.author_id === actor.id || isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || teamEditor)) return response.status(403).json({ error: "You do not have permission to update this activity." });
     const { data, error } = await supabase.from("lead_activities").update({ completed_at: input.completed ? new Date().toISOString() : null }).eq("id", activity.id).select().single();
     if (error) throw error;
@@ -428,9 +438,9 @@ app.delete("/api/v1/brokerage/activities/:id", requireBrokerageUser, async (requ
     const actor = request.actor!; const supabase = adminClient();
     const { data: activity, error: activityError } = await supabase.from("lead_activities").select("id, lead_id, author_id").eq("id", z.string().uuid().parse(request.params.id)).single();
     if (activityError || !activity) return response.status(404).json({ error: "Activity not found." });
-    const { data: lead } = await supabase.from("sales_leads").select("id, team_id, department_id").eq("id", activity.lead_id).maybeSingle();
+    const { data: lead } = await supabase.from("sales_leads").select("id, team_id, owner_id, department_id").eq("id", activity.lead_id).maybeSingle();
     if (!lead) return response.status(404).json({ error: "Lead not found." });
-    const scope = await teamScope(actor); const teamEditor = !!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team");
+    const scope = await teamScope(actor); const teamEditor = inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.edit_team");
     if (!(activity.author_id === actor.id || isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || teamEditor)) return response.status(403).json({ error: "You do not have permission to delete this activity." });
     const { error } = await supabase.from("lead_activities").delete().eq("id", activity.id);
     if (error) throw error;
@@ -442,7 +452,7 @@ app.delete("/api/v1/brokerage/activities/:id", requireBrokerageUser, async (requ
 app.get("/api/v1/brokerage/leads/:id/detail", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
   try {
     const actor = request.actor!; const supabase = adminClient(); const leadId = z.string().uuid().parse(request.params.id); const { data: lead, error } = await supabase.from("sales_leads").select("*").eq("id", leadId).single();
-    if (error || !lead) return response.status(404).json({ error: "Lead not found." }); const scope = await teamScope(actor); const teamReadable = !!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.view_team"); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || teamReadable;
+    if (error || !lead) return response.status(404).json({ error: "Lead not found." }); const scope = await teamScope(actor); const teamReadable = inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.view_team"); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || teamReadable;
     if (!allowed) return response.status(403).json({ error: "Lead is outside your work scope." }); const [activities, comments, customer, quotes] = await Promise.all([supabase.from("lead_activities").select("*").eq("lead_id", lead.id).order("created_at", { ascending: false }), supabase.from("record_comments").select("*").eq("entity_type", "LEAD").eq("entity_id", lead.id).order("created_at", { ascending: false }), supabase.from("brokerage_customers").select("*").eq("lead_id", lead.id).maybeSingle(), supabase.from("sales_quotes").select("*").eq("lead_id", lead.id).order("updated_at", { ascending: false })]);
     const canManage = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id);
     response.json({ lead, activities: await withAuthorDetails(supabase, activities.data ?? [], actor.id, canManage), comments: await withAuthorDetails(supabase, comments.data ?? [], actor.id, canManage), customer: customer.data ?? null, quotes: quotes.data ?? [] });
@@ -452,7 +462,7 @@ app.get("/api/v1/brokerage/leads/:id/detail", requireBrokerageUser, async (reque
 app.post("/api/v1/brokerage/leads/:id/comments", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
   try {
     const actor = request.actor!; const input = commentSchema.parse(request.body); const supabase = adminClient(); const leadId = z.string().uuid().parse(request.params.id); const { data: lead, error } = await supabase.from("sales_leads").select("id, department_id, owner_id, team_id").eq("id", leadId).single();
-    if (error || !lead) return response.status(404).json({ error: "Lead not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (!!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team"));
+    if (error || !lead) return response.status(404).json({ error: "Lead not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.edit_team"));
     if (!allowed) return response.status(403).json({ error: "Lead is outside your work scope." }); const { data, error: insertError } = await supabase.from("record_comments").insert({ entity_type: "LEAD", entity_id: lead.id, author_id: actor.id, body: input.body }).select().single(); if (insertError) throw insertError;
     if (lead.owner_id !== actor.id) await supabase.from("notifications").insert({ recipient_id: lead.owner_id, kind: "LEAD_COMMENT", title: "New lead comment", body: input.body.slice(0, 140), entity_type: "LEAD", entity_id: lead.id }); await writeAudit(supabase, actor.id, "LEAD_COMMENT_ADDED", "lead", lead.id); response.status(201).json({ comment: data });
   } catch (error) { next(error); }
@@ -481,7 +491,7 @@ app.post("/api/v1/brokerage/leads/:id/convert", requireBrokerageUser, async (req
   try {
     const actor = request.actor!; const supabase = adminClient(); const { data: lead, error: leadError } = await supabase.from("sales_leads").select("*").eq("id", z.string().uuid().parse(request.params.id)).single();
     if (leadError || !lead) return response.status(404).json({ error: "Lead not found." });
-    const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (!!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team"));
+    const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.edit_team"));
     if (!allowed) return response.status(403).json({ error: "You do not have permission to convert this lead." });
     const { data: customer, error } = await supabase.from("brokerage_customers").upsert({ lead_id: lead.id, sales_department_id: lead.department_id, owner_id: lead.owner_id, company_name: lead.company_name, contact_name: lead.contact_name, contact_email: lead.contact_email, contact_phone: lead.contact_phone }, { onConflict: "lead_id" }).select().single();
     if (error) throw error; await supabase.from("sales_leads").update({ stage: "CUSTOMER" }).eq("id", lead.id); await writeAudit(supabase, actor.id, "LEAD_CONVERTED", "lead", lead.id, { customer_id: customer.id }); response.json({ customer });
@@ -494,7 +504,7 @@ app.get("/api/v1/brokerage/customers/:id/profile", requireBrokerageUser, async (
     const { data: customer, error } = await supabase.from("brokerage_customers").select("*").eq("id", customerId).single();
     if (error || !customer) return response.status(404).json({ error: "Customer not found." });
     const scope = await teamScope(actor); const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("id, owner_id, team_id, department_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
-    const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id) || customer.owner_id === actor.id || (lead && !!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.view_team"));
+    const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id) || customer.owner_id === actor.id || (lead && inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.view_team"));
     if (!allowed) return response.status(403).json({ error: "Customer is outside your work scope." });
     const [activities, comments, quotes, shipments] = await Promise.all([customer.lead_id ? supabase.from("lead_activities").select("*").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("record_comments").select("*").eq("entity_type", "CUSTOMER").eq("entity_id", customer.id).order("created_at", { ascending: false }), customer.lead_id ? supabase.from("sales_quotes").select("id, pickup_location, delivery_location, stage, quoted_rate, created_at").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("brokerage_shipments").select("id, quote_id, reference_number, status, sales_status, operations_department_id, pickup_location, delivery_location, equipment_type, amount_quoted, amount_agreed, pickup_date, delivery_date, created_at, updated_at, brokerage_invoices(invoice_number, status)").eq("customer_id", customer.id).order("created_at", { ascending: false })]);
     const canManage = isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id);
@@ -510,9 +520,9 @@ app.post("/api/v1/brokerage/customers/:id/comments", requireBrokerageUser, async
     const customerId = z.string().uuid().parse(request.params.id);
     const { data: customer, error } = await supabase.from("brokerage_customers").select("id, sales_department_id, owner_id, lead_id").eq("id", customerId).single();
     if (error || !customer) return response.status(404).json({ error: "Customer not found." });
-    const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("team_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
+    const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("team_id, owner_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
     const scope = await teamScope(actor);
-    const teamEditor = !!lead?.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team");
+    const teamEditor = inTeam(scope, lead?.team_id, lead?.owner_id) && scope.permissions.has("sales.leads.edit_team");
     if (!(isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id) || customer.owner_id === actor.id || teamEditor)) return response.status(403).json({ error: "Customer is outside your work scope." });
     const { data, error: insertError } = await supabase.from("record_comments").insert({ entity_type: "CUSTOMER", entity_id: customer.id, author_id: actor.id, body: input.body }).select().single();
     if (insertError) throw insertError;
@@ -532,7 +542,7 @@ app.get("/api/v1/brokerage/customers", requireBrokerageUser, async (request: Bro
       else {
         const scope = await teamScope(actor);
         let leadQuery = supabase.from("sales_leads").select("id").eq("department_id", actor.department_id!);
-        leadQuery = scope.permissions.has("sales.leads.view_team") && scope.leadTeamIds.length ? leadQuery.in("team_id", scope.leadTeamIds) : leadQuery.eq("owner_id", actor.id);
+        leadQuery = scope.permissions.has("sales.leads.view_team") && scope.leadTeamIds.length ? leadQuery.or(`owner_id.eq.${actor.id},${teamFilter(scope, "owner_id")}`) : leadQuery.eq("owner_id", actor.id);
         const { data: leads, error: leadsError } = await leadQuery;
         if (leadsError) throw leadsError;
         const leadIds = (leads ?? []).map((lead) => lead.id);
@@ -555,7 +565,7 @@ app.patch("/api/v1/brokerage/customers/:id", requireBrokerageUser, async (reques
     const customerId = z.string().uuid().parse(request.params.id);
     const { data: customer, error: customerError } = await supabase.from("brokerage_customers").select("*").eq("id", customerId).single();
     if (customerError || !customer) return response.status(404).json({ error: "Customer not found." });
-    const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("id, team_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
+    const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("id, team_id, owner_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
     const scope = await teamScope(actor);
     if (!canAccessSalesCustomer(actor, customer, lead, scope, true)) return response.status(403).json({ error: "Customer update permission is required." });
     const update = { ...input, contact_email: input.contact_email === "" ? null : input.contact_email };
@@ -583,7 +593,7 @@ app.post("/api/v1/brokerage/customers/:id/shipments", requireBrokerageUser, asyn
     const customerId = z.string().uuid().parse(request.params.id);
     const { data: customer, error: customerError } = await supabase.from("brokerage_customers").select("*").eq("id", customerId).single();
     if (customerError || !customer) return response.status(404).json({ error: "Customer not found." });
-    const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("id, team_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
+    const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("id, team_id, owner_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
     const scope = await teamScope(actor);
     if (!canAccessSalesCustomer(actor, customer, lead, scope, true)) return response.status(403).json({ error: "Customer shipment creation permission is required." });
     if (!lead?.id) return response.status(422).json({ error: "This customer is not linked to a Sales lead." });
@@ -613,7 +623,7 @@ app.patch("/api/v1/brokerage/sales-shipments/:id", requireBrokerageUser, async (
     if (shipmentError || !shipment) return response.status(404).json({ error: "Shipment not found." });
     const customer: any = Array.isArray((shipment as any).brokerage_customers) ? (shipment as any).brokerage_customers[0] : (shipment as any).brokerage_customers;
     if (!customer) return response.status(422).json({ error: "This shipment is not linked to a customer profile." });
-    const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("id, team_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
+    const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("id, team_id, owner_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
     const scope = await teamScope(actor);
     if (!canAccessSalesCustomer(actor, customer, lead, scope, true)) return response.status(403).json({ error: "Customer shipment update permission is required." });
     const { quoted_rate, agreed_rate, status, ...shipmentInput } = input;
@@ -655,7 +665,7 @@ app.patch("/api/v1/brokerage/quotes/:id", requireBrokerageUser, async (request: 
     const actor = request.actor!; const input = quoteUpdateSchema.parse(request.body); const supabase = adminClient();
     const { data: quote, error: quoteError } = await supabase.from("sales_quotes").select("*, sales_leads(*)").eq("id", z.string().uuid().parse(request.params.id)).single();
     if (quoteError || !quote) return response.status(404).json({ error: "Quote not found." }); const lead: any = Array.isArray((quote as any).sales_leads) ? (quote as any).sales_leads[0] : (quote as any).sales_leads;
-    const scope = await teamScope(actor); const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (!!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team")));
+    const scope = await teamScope(actor); const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.edit_team")));
     if (!allowed || !["DRAFT", "REJECTED"].includes((quote as any).stage)) return response.status(403).json({ error: "This quote cannot be edited in its current stage." });
     const { data, error } = await supabase.from("sales_quotes").update(input).eq("id", quote.id).select().single(); if (error) throw error; await writeAudit(supabase, actor.id, "QUOTE_UPDATED", "quote", quote.id, { fields: Object.keys(input) }); response.json({ quote: data });
   } catch (error) { next(error); }
@@ -669,7 +679,7 @@ app.post("/api/v1/brokerage/quotes/:id/submit", requireBrokerageUser, async (req
     if (error || !quote) return response.status(404).json({ error: "Quote not found." });
     const lead: any = Array.isArray((quote as any).sales_leads) ? (quote as any).sales_leads[0] : (quote as any).sales_leads;
     const scope = await teamScope(actor);
-    const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (!!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team")));
+    const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.edit_team")));
     if (!allowed) return response.status(403).json({ error: "Quote submission permission is required." });
     if (!['DRAFT', 'REJECTED'].includes((quote as any).stage)) return response.status(422).json({ error: "Only a draft or reworked quote can be submitted." });
     const { data, error: updateError } = await supabase.from("sales_quotes").update({ stage: "SUBMITTED", rejection_note: null }).eq("id", quote.id).select().single();
@@ -686,14 +696,14 @@ app.get("/api/v1/brokerage/quotes/:id/detail", requireBrokerageUser, async (requ
   try {
     const actor = request.actor!; const supabase = adminClient(); const quoteId = z.string().uuid().parse(request.params.id);
     const { data: quote, error } = await supabase.from("sales_quotes").select("*, sales_leads(id, owner_id, team_id, department_id)").eq("id", quoteId).single(); if (error || !quote) return response.status(404).json({ error: "Quote not found." });
-    const lead: any = Array.isArray((quote as any).sales_leads) ? (quote as any).sales_leads[0] : (quote as any).sales_leads; const scope = await teamScope(actor); const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (!!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.view_team")));
+    const lead: any = Array.isArray((quote as any).sales_leads) ? (quote as any).sales_leads[0] : (quote as any).sales_leads; const scope = await teamScope(actor); const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.view_team")));
     if (!allowed) return response.status(403).json({ error: "Quote is outside your work scope." }); const [attachments, events, comments] = await Promise.all([supabase.from("quote_attachments").select("*").eq("quote_id", quoteId).order("created_at", { ascending: false }), supabase.from("quote_events").select("*").eq("quote_id", quoteId).order("created_at", { ascending: false }), supabase.from("record_comments").select("*").eq("entity_type", "QUOTE").eq("entity_id", quoteId).order("created_at", { ascending: false })]); const canManage = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id); response.json({ quote, attachments: attachments.data ?? [], events: events.data ?? [], comments: await withAuthorDetails(supabase, comments.data ?? [], actor.id, canManage) });
   } catch (error) { next(error); }
 });
 
 app.post("/api/v1/brokerage/quotes/:id/upload-url", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
   try {
-    const actor = request.actor!; const input = fileSchema.parse(request.body); const supabase = adminClient(); const quoteId = z.string().uuid().parse(request.params.id); const { data: quote } = await supabase.from("sales_quotes").select("id, created_by, sales_leads(owner_id, team_id, department_id)").eq("id", quoteId).maybeSingle(); if (!quote) return response.status(404).json({ error: "Quote not found." }); const lead: any = Array.isArray((quote as any).sales_leads) ? (quote as any).sales_leads[0] : (quote as any).sales_leads; const scope = await teamScope(actor); const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (!!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team"))); if (!allowed) return response.status(403).json({ error: "Quote update permission is required." }); const extension = input.file_name.split(".").pop()?.toLowerCase(); if (!extension || !["pdf", "jpg", "jpeg", "png"].includes(extension)) return response.status(422).json({ error: "Only PDF, JPG, JPEG, and PNG files are allowed." }); const path = `${actor.id}/${quoteId}/${crypto.randomUUID()}.${extension}`; const { data, error } = await supabase.storage.from("brokerage-quote-attachments").createSignedUploadUrl(path); if (error) throw error; response.json({ path, signed_url: data.signedUrl });
+    const actor = request.actor!; const input = fileSchema.parse(request.body); const supabase = adminClient(); const quoteId = z.string().uuid().parse(request.params.id); const { data: quote } = await supabase.from("sales_quotes").select("id, created_by, sales_leads(owner_id, team_id, department_id)").eq("id", quoteId).maybeSingle(); if (!quote) return response.status(404).json({ error: "Quote not found." }); const lead: any = Array.isArray((quote as any).sales_leads) ? (quote as any).sales_leads[0] : (quote as any).sales_leads; const scope = await teamScope(actor); const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.edit_team"))); if (!allowed) return response.status(403).json({ error: "Quote update permission is required." }); const extension = input.file_name.split(".").pop()?.toLowerCase(); if (!extension || !["pdf", "jpg", "jpeg", "png"].includes(extension)) return response.status(422).json({ error: "Only PDF, JPG, JPEG, and PNG files are allowed." }); const path = `${actor.id}/${quoteId}/${crypto.randomUUID()}.${extension}`; const { data, error } = await supabase.storage.from("brokerage-quote-attachments").createSignedUploadUrl(path); if (error) throw error; response.json({ path, signed_url: data.signedUrl });
   } catch (error) { next(error); }
 });
 
@@ -706,7 +716,7 @@ app.post("/api/v1/brokerage/quotes/:id/attachments", requireBrokerageUser, async
     const { data: quote } = await supabase.from("sales_quotes").select("id, created_by, sales_leads(owner_id, team_id, department_id)").eq("id", quoteId).maybeSingle();
     const lead: any = Array.isArray((quote as any)?.sales_leads) ? (quote as any).sales_leads[0] : (quote as any)?.sales_leads;
     const scope = await teamScope(actor);
-    const teamEditor = !!lead?.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team");
+    const teamEditor = inTeam(scope, lead?.team_id, lead?.owner_id) && scope.permissions.has("sales.leads.edit_team");
     if (!lead || !(isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || teamEditor)) return response.status(403).json({ error: "Quote update permission is required." });
     const { data, error } = await supabase.from("quote_attachments").insert({ quote_id: quoteId, uploaded_by: actor.id, ...input }).select().single();
     if (error) throw error;
@@ -733,7 +743,7 @@ app.get("/api/v1/brokerage/quote-attachments/:id/download-url", requireBrokerage
       isSuper(actor) ||
       (isManager(actor) && actor.department_id === lead.department_id) ||
       lead.owner_id === actor.id ||
-      (!!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.view_team"))
+      (inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.view_team"))
     );
     if (!allowed) return response.status(403).json({ error: "Quote attachment is outside your work scope." });
     const { data, error: urlError } = await supabase.storage.from("brokerage-quote-attachments").createSignedUrl((attachment as any).storage_path, 60 * 10);
@@ -751,7 +761,7 @@ app.post("/api/v1/brokerage/quotes/:id/comments", requireBrokerageUser, async (r
     const { data: quote } = await supabase.from("sales_quotes").select("id, created_by, sales_leads(owner_id, team_id, department_id)").eq("id", quoteId).maybeSingle();
     const lead: any = Array.isArray((quote as any)?.sales_leads) ? (quote as any).sales_leads[0] : (quote as any)?.sales_leads;
     const scope = await teamScope(actor);
-    const teamEditor = !!lead?.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.leads.edit_team");
+    const teamEditor = inTeam(scope, lead?.team_id, lead?.owner_id) && scope.permissions.has("sales.leads.edit_team");
     if (!quote || !lead || !(isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || teamEditor)) return response.status(403).json({ error: "Quote is outside your work scope." });
     const { data, error } = await supabase.from("record_comments").insert({ entity_type: "QUOTE", entity_id: quoteId, author_id: actor.id, body: input.body }).select().single();
     if (error) throw error;
@@ -763,9 +773,9 @@ app.post("/api/v1/brokerage/quotes/:id/comments", requireBrokerageUser, async (r
 
 app.post("/api/v1/brokerage/quotes/:id/review", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
   try {
-    const actor = request.actor!; const input = reviewSchema.parse(request.body); const supabase = adminClient(); const { data: quote, error: quoteError } = await supabase.from("sales_quotes").select("id, stage, created_by, sales_leads(department_id, team_id)").eq("id", z.string().uuid().parse(request.params.id)).single();
+    const actor = request.actor!; const input = reviewSchema.parse(request.body); const supabase = adminClient(); const { data: quote, error: quoteError } = await supabase.from("sales_quotes").select("id, stage, created_by, sales_leads(department_id, team_id, owner_id)").eq("id", z.string().uuid().parse(request.params.id)).single();
     if (quoteError || !quote) return response.status(404).json({ error: "Quote not found." }); const lead: any = Array.isArray((quote as any).sales_leads) ? (quote as any).sales_leads[0] : (quote as any).sales_leads; const scope = await teamScope(actor);
-    const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || (!!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.quotes.review")));
+    const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || (inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.quotes.review")));
     if (!allowed) return response.status(403).json({ error: "Quote review permission is required." }); if ((quote as any).stage !== "SUBMITTED") return response.status(422).json({ error: "Only a submitted quote can be reviewed." }); const stage = input.action === "APPROVE" ? "APPROVED" : "REJECTED";
     const { data, error } = await supabase.from("sales_quotes").update({ stage, reviewed_by: actor.id, reviewed_at: new Date().toISOString(), rejection_note: input.action === "REJECT" ? (input.note ?? "Rework requested") : null }).eq("id", quote.id).select().single(); if (error) throw error; await supabase.from("quote_events").insert({ quote_id: quote.id, actor_id: actor.id, event_type: `QUOTE_${stage}`, body: input.note ?? null }); if ((quote as any).created_by) await supabase.from("notifications").insert({ recipient_id: (quote as any).created_by, kind: input.action === "REJECT" ? "QUOTE_REWORK" : "QUOTE_APPROVED", title: input.action === "REJECT" ? "Quote returned for rework" : "Quote approved", body: input.action === "REJECT" ? (input.note ?? "A reviewer requested changes.") : "Your quote is approved and ready for Operations handoff.", entity_type: "QUOTE", entity_id: quote.id }); await writeAudit(supabase, actor.id, `QUOTE_${stage}`, "quote", quote.id, { note: input.note ?? null }); response.json({ quote: data });
   } catch (error) { next(error); }
@@ -775,7 +785,7 @@ app.post("/api/v1/brokerage/quotes/:id/handoff", requireBrokerageUser, async (re
   try {
     const actor = request.actor!; const input = handoffSchema.parse(request.body); const supabase = adminClient(); const { data: quote, error: quoteError } = await supabase.from("sales_quotes").select("*, sales_leads(*)").eq("id", z.string().uuid().parse(request.params.id)).single();
     if (quoteError || !quote) return response.status(404).json({ error: "Quote not found." }); const lead: any = Array.isArray((quote as any).sales_leads) ? (quote as any).sales_leads[0] : (quote as any).sales_leads; const scope = await teamScope(actor);
-    const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || (!!lead.team_id && scope.leadTeamIds.includes(lead.team_id) && scope.permissions.has("sales.quotes.handoff")));
+    const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || (inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.quotes.handoff")));
     if (!allowed) return response.status(403).json({ error: "Operations handoff permission is required." }); if ((quote as any).stage !== "APPROVED") return response.status(422).json({ error: "Only an approved quote can be handed to Operations." });
     const { data: operationsDepartment } = await supabase.from("departments").select("id, business_unit, function").eq("id", input.operations_department_id).single(); if (!operationsDepartment || (operationsDepartment as any).business_unit !== "BROKERAGE" || (operationsDepartment as any).function !== "OPERATIONS") return response.status(422).json({ error: "Choose a Brokerage Operations department." });
     const { data: customer } = await supabase.from("brokerage_customers").select("id").eq("lead_id", lead.id).maybeSingle();
@@ -796,7 +806,15 @@ app.post("/api/v1/brokerage/quotes/:id/handoff", requireBrokerageUser, async (re
 });
 
 app.get("/api/v1/brokerage/operations-directory", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
-  try { const actor = request.actor!; if (!isOperations(actor) || !isManager(actor) || !actor.department_id) return response.status(403).json({ error: "Only a Brokerage Operations Manager can manage assignments." }); const supabase = adminClient(); const [{ data: users, error }, { data: teams, error: teamsError }] = await Promise.all([supabase.from("profiles").select("id, full_name, email, role").eq("department_id", actor.department_id).eq("is_active", true).eq("role", "AGENT"), supabase.from("teams").select("id, name, team_lead_id").eq("department_id", actor.department_id).eq("is_active", true).order("name")]); if (error || teamsError) throw error ?? teamsError; response.json({ users: users ?? [], teams: teams ?? [] }); } catch (error) { next(error); }
+  try { const actor = request.actor!; if (!isOperations(actor) || !actor.department_id) return response.status(403).json({ error: "Only Brokerage Operations can view this directory." });
+    // Managers see the whole department; a Team Lead sees only their own team's agents (names for their view and exception owners).
+    const scope = isManager(actor) ? null : await teamScope(actor);
+    if (scope && !(scope.leadTeamIds.length && scope.permissions.has("operations.shipments.view_team"))) return response.status(403).json({ error: "Only a Brokerage Operations Manager or Team Lead can view this directory." });
+    const supabase = adminClient();
+    let userQuery = supabase.from("profiles").select("id, full_name, email, role").eq("department_id", actor.department_id).eq("is_active", true).eq("role", "AGENT");
+    let teamQuery = supabase.from("teams").select("id, name, team_lead_id").eq("department_id", actor.department_id).eq("is_active", true).order("name");
+    if (scope) { userQuery = userQuery.in("id", scope.memberIds.length ? scope.memberIds : ["00000000-0000-0000-0000-000000000000"]); teamQuery = teamQuery.in("id", scope.leadTeamIds); }
+    const [{ data: users, error }, { data: teams, error: teamsError }] = await Promise.all([userQuery, teamQuery]); if (error || teamsError) throw error ?? teamsError; response.json({ users: users ?? [], teams: teams ?? [] }); } catch (error) { next(error); }
 });
 
 app.patch("/api/v1/brokerage/shipments/:id", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
@@ -804,13 +822,13 @@ app.patch("/api/v1/brokerage/shipments/:id", requireBrokerageUser, async (reques
     const actor = request.actor!; const input = shipmentUpdateSchema.parse(request.body); const supabase = adminClient(); const { data: shipment, error: shipmentError } = await supabase.from("brokerage_shipments").select("*").eq("id", z.string().uuid().parse(request.params.id)).single();
     if (shipmentError || !shipment) return response.status(404).json({ error: "Shipment not found." }); const scope = await teamScope(actor);
     const departmentManager = isManager(actor) && actor.department_id === shipment.operations_department_id;
-    const teamViewer = !!shipment.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.shipments.view_team"); const ownScope = shipment.assigned_to === actor.id;
+    const teamViewer = inTeam(scope, shipment.team_id, shipment.assigned_to) && scope.permissions.has("operations.shipments.view_team"); const ownScope = shipment.assigned_to === actor.id;
     if (!(isSuper(actor) || departmentManager || ownScope || teamViewer)) return response.status(403).json({ error: "Shipment is outside your work scope." });
-    const teamUpdater = !!shipment.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.shipments.update_team"); const canUpdate = isSuper(actor) || departmentManager || ownScope || teamUpdater;
-    const canAssign = isSuper(actor) || departmentManager || (!!shipment.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.shipments.assign"));
-    const canResolveExceptions = isSuper(actor) || departmentManager || (!!shipment.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.exceptions.resolve"));
+    const teamUpdater = inTeam(scope, shipment.team_id, shipment.assigned_to) && scope.permissions.has("operations.shipments.update_team"); const canUpdate = isSuper(actor) || departmentManager || ownScope || teamUpdater;
+    const canAssign = isSuper(actor) || departmentManager || (inTeam(scope, shipment.team_id, shipment.assigned_to) && scope.permissions.has("operations.shipments.assign"));
+    const canResolveExceptions = isSuper(actor) || departmentManager || (inTeam(scope, shipment.team_id, shipment.assigned_to) && scope.permissions.has("operations.exceptions.resolve"));
     const canRecordFinance = canUpdate;
-    const canManageInvoiceReadiness = isSuper(actor) || departmentManager || (!!shipment.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.billing.mark_invoice_ready"));
+    const canManageInvoiceReadiness = isSuper(actor) || departmentManager || (inTeam(scope, shipment.team_id, shipment.assigned_to) && scope.permissions.has("operations.billing.mark_invoice_ready"));
     if ((input.assigned_to !== undefined || input.team_id !== undefined) && !canAssign) return response.status(403).json({ error: "Shipment assignment permission is required." });
     if (input.status && ["QUOTED", "PAID"].includes(input.status)) return response.status(422).json({ error: "Use the Sales commercial lifecycle or invoice ledger for this status." });
     const changesFinancials = input.amount_quoted !== undefined || input.amount_invoiced !== undefined || input.amount_paid !== undefined || input.payment_status !== undefined || input.pickup_date !== undefined || input.delivery_date !== undefined;
@@ -915,8 +933,8 @@ app.get("/api/v1/brokerage/invoices", requireBrokerageUser, async (request: Brok
     // Agents (AC-4, BO-1) see invoices only for shipments in their own scope; managers see the department (BO-6).
     if (!isSuper(actor) && !isManager(actor)) {
       const scope = await teamScope(actor);
-      const teams = scope.permissions.has("operations.shipments.view_team") ? scope.leadTeamIds : [];
-      const { data: own } = await supabase.from("brokerage_shipments").select("id").eq("operations_department_id", actor.department_id!).or(teams.length ? `assigned_to.eq.${actor.id},team_id.in.(${teams.join(",")})` : `assigned_to.eq.${actor.id}`);
+      const team = scope.permissions.has("operations.shipments.view_team") && scope.leadTeamIds.length;
+      const { data: own } = await supabase.from("brokerage_shipments").select("id").eq("operations_department_id", actor.department_id!).or(team ? `assigned_to.eq.${actor.id},${teamFilter(scope, "assigned_to")}` : `assigned_to.eq.${actor.id}`);
       query = query.in("shipment_id", (own ?? []).map((row) => row.id).concat("00000000-0000-0000-0000-000000000000"));
     }
     const { data, error } = await query;
@@ -926,15 +944,15 @@ app.get("/api/v1/brokerage/invoices", requireBrokerageUser, async (request: Brok
 });
 
 app.post("/api/v1/brokerage/shipments/:id/documents", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
-  try { const actor = request.actor!; const input = documentSchema.parse(request.body); const supabase = adminClient(); const { data: shipment } = await supabase.from("brokerage_shipments").select("*").eq("id", z.string().uuid().parse(request.params.id)).maybeSingle(); if (!shipment) return response.status(404).json({ error: "Shipment not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id) || shipment.assigned_to === actor.id || (!!shipment.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.shipments.update_team")); if (!allowed) return response.status(403).json({ error: "Shipment update permission is required." }); const { data, error } = await supabase.from("shipment_documents").insert({ ...input, shipment_id: shipment.id, uploaded_by: actor.id }).select().single(); if (error) throw error; await writeAudit(supabase, actor.id, "SHIPMENT_DOCUMENT_ADDED", "shipment", shipment.id, { document_type: input.document_type }); response.status(201).json({ document: data }); } catch (error) { next(error); }
+  try { const actor = request.actor!; const input = documentSchema.parse(request.body); const supabase = adminClient(); const { data: shipment } = await supabase.from("brokerage_shipments").select("*").eq("id", z.string().uuid().parse(request.params.id)).maybeSingle(); if (!shipment) return response.status(404).json({ error: "Shipment not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id) || shipment.assigned_to === actor.id || (inTeam(scope, shipment.team_id, shipment.assigned_to) && scope.permissions.has("operations.shipments.update_team")); if (!allowed) return response.status(403).json({ error: "Shipment update permission is required." }); const { data, error } = await supabase.from("shipment_documents").insert({ ...input, shipment_id: shipment.id, uploaded_by: actor.id }).select().single(); if (error) throw error; await writeAudit(supabase, actor.id, "SHIPMENT_DOCUMENT_ADDED", "shipment", shipment.id, { document_type: input.document_type }); response.status(201).json({ document: data }); } catch (error) { next(error); }
 });
 
 app.patch("/api/v1/brokerage/documents/:id/review", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
-  try { const actor = request.actor!; const body = documentReviewSchema.parse(request.body); const supabase = adminClient(); const { data: document, error: documentError } = await supabase.from("shipment_documents").select("id, shipment_id, uploaded_by, document_type, brokerage_shipments(operations_department_id, team_id)").eq("id", z.string().uuid().parse(request.params.id)).single(); if (documentError || !document) return response.status(404).json({ error: "Document not found." }); const shipment: any = Array.isArray((document as any).brokerage_shipments) ? (document as any).brokerage_shipments[0] : (document as any).brokerage_shipments; const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment?.operations_department_id) || (!!shipment?.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.documents.review")); if (!allowed) return response.status(403).json({ error: "Document review permission is required." }); const review = { ...body, reviewed_by: actor.id, reviewed_at: new Date().toISOString() }; const { data, error } = await supabase.from("shipment_documents").update(review).eq("id", document.id).select().single(); if (error || !data) throw error; if ((document as any).uploaded_by !== actor.id) await supabase.from("notifications").insert({ recipient_id: (document as any).uploaded_by, kind: body.is_verified ? "DOCUMENT_VERIFIED" : "DOCUMENT_REJECTED", title: body.is_verified ? "Document verified" : "Document returned", body: body.review_note ?? `${(document as any).document_type} was ${body.is_verified ? "verified" : "returned for changes"}.`, entity_type: "SHIPMENT", entity_id: (document as any).shipment_id }); await writeAudit(supabase, actor.id, "SHIPMENT_DOCUMENT_REVIEWED", "shipment_document", data.id, body); response.json({ document: data }); } catch (error) { next(error); }
+  try { const actor = request.actor!; const body = documentReviewSchema.parse(request.body); const supabase = adminClient(); const { data: document, error: documentError } = await supabase.from("shipment_documents").select("id, shipment_id, uploaded_by, document_type, brokerage_shipments(operations_department_id, team_id, assigned_to)").eq("id", z.string().uuid().parse(request.params.id)).single(); if (documentError || !document) return response.status(404).json({ error: "Document not found." }); const shipment: any = Array.isArray((document as any).brokerage_shipments) ? (document as any).brokerage_shipments[0] : (document as any).brokerage_shipments; const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment?.operations_department_id) || (inTeam(scope, shipment?.team_id, shipment?.assigned_to) && scope.permissions.has("operations.documents.review")); if (!allowed) return response.status(403).json({ error: "Document review permission is required." }); const review = { ...body, reviewed_by: actor.id, reviewed_at: new Date().toISOString() }; const { data, error } = await supabase.from("shipment_documents").update(review).eq("id", document.id).select().single(); if (error || !data) throw error; if ((document as any).uploaded_by !== actor.id) await supabase.from("notifications").insert({ recipient_id: (document as any).uploaded_by, kind: body.is_verified ? "DOCUMENT_VERIFIED" : "DOCUMENT_REJECTED", title: body.is_verified ? "Document verified" : "Document returned", body: body.review_note ?? `${(document as any).document_type} was ${body.is_verified ? "verified" : "returned for changes"}.`, entity_type: "SHIPMENT", entity_id: (document as any).shipment_id }); await writeAudit(supabase, actor.id, "SHIPMENT_DOCUMENT_REVIEWED", "shipment_document", data.id, body); response.json({ document: data }); } catch (error) { next(error); }
 });
 
 app.get("/api/v1/brokerage/documents/:id/download-url", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
-  try { const actor = request.actor!; const supabase = adminClient(); const { data: document, error } = await supabase.from("shipment_documents").select("id, storage_path, brokerage_shipments(operations_department_id, assigned_to, team_id)").eq("id", z.string().uuid().parse(request.params.id)).single(); if (error || !document) return response.status(404).json({ error: "Document not found." }); const shipment: any = Array.isArray((document as any).brokerage_shipments) ? (document as any).brokerage_shipments[0] : (document as any).brokerage_shipments; const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment?.operations_department_id) || shipment?.assigned_to === actor.id || (!!shipment?.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.shipments.view_team")); if (!allowed) return response.status(403).json({ error: "Document is outside your work scope." }); const { data: signed, error: signError } = await supabase.storage.from("brokerage-documents").createSignedUrl((document as any).storage_path, 60); if (signError) throw signError; response.json({ signed_url: signed.signedUrl }); } catch (error) { next(error); }
+  try { const actor = request.actor!; const supabase = adminClient(); const { data: document, error } = await supabase.from("shipment_documents").select("id, storage_path, brokerage_shipments(operations_department_id, assigned_to, team_id)").eq("id", z.string().uuid().parse(request.params.id)).single(); if (error || !document) return response.status(404).json({ error: "Document not found." }); const shipment: any = Array.isArray((document as any).brokerage_shipments) ? (document as any).brokerage_shipments[0] : (document as any).brokerage_shipments; const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment?.operations_department_id) || shipment?.assigned_to === actor.id || (inTeam(scope, shipment?.team_id, shipment?.assigned_to) && scope.permissions.has("operations.shipments.view_team")); if (!allowed) return response.status(403).json({ error: "Document is outside your work scope." }); const { data: signed, error: signError } = await supabase.storage.from("brokerage-documents").createSignedUrl((document as any).storage_path, 60); if (signError) throw signError; response.json({ signed_url: signed.signedUrl }); } catch (error) { next(error); }
 });
 
 app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
@@ -955,7 +973,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
     if (!isSuper(actor)) {
       if (isSales(actor)) {
         leadQuery = leadQuery.eq("department_id", actor.department_id!);
-        if (!isManager(actor)) leadQuery = scope.permissions.has("sales.reports.view_team") && scope.leadTeamIds.length ? leadQuery.in("team_id", scope.leadTeamIds) : leadQuery.eq("owner_id", actor.id);
+        if (!isManager(actor)) leadQuery = scope.permissions.has("sales.reports.view_team") && scope.leadTeamIds.length ? leadQuery.or(`owner_id.eq.${actor.id},${teamFilter(scope, "owner_id")}`) : leadQuery.eq("owner_id", actor.id);
       } else leadQuery = leadQuery.eq("id", "00000000-0000-0000-0000-000000000000");
     }
     if (range.agent_id) leadQuery = leadQuery.eq("owner_id", range.agent_id);
@@ -984,7 +1002,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
     if (!isSuper(actor)) {
       if (isOperations(actor)) {
         shipmentQuery = shipmentQuery.eq("operations_department_id", actor.department_id!);
-        if (!isManager(actor)) shipmentQuery = scope.permissions.has("operations.reports.view_team") && scope.leadTeamIds.length ? shipmentQuery.or(`assigned_to.eq.${actor.id},team_id.in.(${scope.leadTeamIds.join(",")})`) : shipmentQuery.eq("assigned_to", actor.id);
+        if (!isManager(actor)) shipmentQuery = scope.permissions.has("operations.reports.view_team") && scope.leadTeamIds.length ? shipmentQuery.or(`assigned_to.eq.${actor.id},${teamFilter(scope, "assigned_to")}`) : shipmentQuery.eq("assigned_to", actor.id);
       } else shipmentQuery = shipmentQuery.eq("id", "00000000-0000-0000-0000-000000000000");
     }
     if (range.from) shipmentQuery = shipmentQuery.gte("created_at", `${range.from}T00:00:00.000Z`);
@@ -1167,15 +1185,15 @@ app.get("/api/v1/brokerage/overview", requireSuperAdmin, async (_request, respon
 });
 
 app.get("/api/v1/brokerage/shipments/:id/detail", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
-  try { const actor = request.actor!; const supabase = adminClient(); const { data: shipment, error } = await supabase.from("brokerage_shipments").select("*").eq("id", z.string().uuid().parse(request.params.id)).single(); if (error || !shipment) return response.status(404).json({ error: "Shipment not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id) || shipment.assigned_to === actor.id || (!!shipment.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.shipments.view_team")); if (!allowed) return response.status(403).json({ error: "Shipment is outside your work scope." }); const [documents, events, comments, invoice] = await Promise.all([supabase.from("shipment_documents").select("*").eq("shipment_id", shipment.id).order("created_at", { ascending: false }), supabase.from("shipment_events").select("*").eq("shipment_id", shipment.id).order("created_at", { ascending: false }), supabase.from("record_comments").select("*").eq("entity_type", "SHIPMENT").eq("entity_id", shipment.id).order("created_at", { ascending: false }), supabase.from("brokerage_invoices").select("*").eq("shipment_id", shipment.id).maybeSingle()]); response.json({ shipment, documents: documents.data ?? [], events: events.data ?? [], comments: comments.data ?? [], invoice: invoice.data ?? null }); } catch (error) { next(error); }
+  try { const actor = request.actor!; const supabase = adminClient(); const { data: shipment, error } = await supabase.from("brokerage_shipments").select("*").eq("id", z.string().uuid().parse(request.params.id)).single(); if (error || !shipment) return response.status(404).json({ error: "Shipment not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id) || shipment.assigned_to === actor.id || (inTeam(scope, shipment.team_id, shipment.assigned_to) && scope.permissions.has("operations.shipments.view_team")); if (!allowed) return response.status(403).json({ error: "Shipment is outside your work scope." }); const [documents, events, comments, invoice] = await Promise.all([supabase.from("shipment_documents").select("*").eq("shipment_id", shipment.id).order("created_at", { ascending: false }), supabase.from("shipment_events").select("*").eq("shipment_id", shipment.id).order("created_at", { ascending: false }), supabase.from("record_comments").select("*").eq("entity_type", "SHIPMENT").eq("entity_id", shipment.id).order("created_at", { ascending: false }), supabase.from("brokerage_invoices").select("*").eq("shipment_id", shipment.id).maybeSingle()]); response.json({ shipment, documents: documents.data ?? [], events: events.data ?? [], comments: comments.data ?? [], invoice: invoice.data ?? null }); } catch (error) { next(error); }
 });
 
 app.post("/api/v1/brokerage/shipments/:id/upload-url", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
-  try { const actor = request.actor!; const input = fileSchema.parse(request.body); const supabase = adminClient(); const { data: shipment } = await supabase.from("brokerage_shipments").select("*").eq("id", z.string().uuid().parse(request.params.id)).maybeSingle(); if (!shipment) return response.status(404).json({ error: "Shipment not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id) || shipment.assigned_to === actor.id || (!!shipment.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.shipments.update_team")); if (!allowed) return response.status(403).json({ error: "Shipment is outside your update scope." }); const extension = input.file_name.split(".").pop()?.toLowerCase(); if (!extension || !["pdf", "jpg", "jpeg", "png"].includes(extension)) return response.status(422).json({ error: "Only PDF, JPG, JPEG, and PNG files are allowed." }); const path = `${actor.id}/${shipment.id}/${crypto.randomUUID()}.${extension}`; const { data, error } = await supabase.storage.from("brokerage-documents").createSignedUploadUrl(path); if (error) throw error; response.json({ path, token: data.token, signed_url: data.signedUrl }); } catch (error) { next(error); }
+  try { const actor = request.actor!; const input = fileSchema.parse(request.body); const supabase = adminClient(); const { data: shipment } = await supabase.from("brokerage_shipments").select("*").eq("id", z.string().uuid().parse(request.params.id)).maybeSingle(); if (!shipment) return response.status(404).json({ error: "Shipment not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id) || shipment.assigned_to === actor.id || (inTeam(scope, shipment.team_id, shipment.assigned_to) && scope.permissions.has("operations.shipments.update_team")); if (!allowed) return response.status(403).json({ error: "Shipment is outside your update scope." }); const extension = input.file_name.split(".").pop()?.toLowerCase(); if (!extension || !["pdf", "jpg", "jpeg", "png"].includes(extension)) return response.status(422).json({ error: "Only PDF, JPG, JPEG, and PNG files are allowed." }); const path = `${actor.id}/${shipment.id}/${crypto.randomUUID()}.${extension}`; const { data, error } = await supabase.storage.from("brokerage-documents").createSignedUploadUrl(path); if (error) throw error; response.json({ path, token: data.token, signed_url: data.signedUrl }); } catch (error) { next(error); }
 });
 
 app.post("/api/v1/brokerage/shipments/:id/comments", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
-  try { const actor = request.actor!; const input = commentSchema.parse(request.body); const supabase = adminClient(); const { data: shipment } = await supabase.from("brokerage_shipments").select("*").eq("id", z.string().uuid().parse(request.params.id)).maybeSingle(); if (!shipment) return response.status(404).json({ error: "Shipment not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id) || shipment.assigned_to === actor.id || (!!shipment.team_id && scope.leadTeamIds.includes(shipment.team_id) && scope.permissions.has("operations.shipments.view_team")); if (!allowed) return response.status(403).json({ error: "Shipment is outside your work scope." }); const { data, error } = await supabase.from("record_comments").insert({ entity_type: "SHIPMENT", entity_id: shipment.id, author_id: actor.id, body: input.body }).select().single(); if (error) throw error; if (shipment.assigned_to && shipment.assigned_to !== actor.id) await supabase.from("notifications").insert({ recipient_id: shipment.assigned_to, kind: "SHIPMENT_COMMENT", title: "New shipment comment", body: input.body.slice(0, 140), entity_type: "SHIPMENT", entity_id: shipment.id }); await writeAudit(supabase, actor.id, "COMMENT_ADDED", "shipment", shipment.id); response.status(201).json({ comment: data }); } catch (error) { next(error); }
+  try { const actor = request.actor!; const input = commentSchema.parse(request.body); const supabase = adminClient(); const { data: shipment } = await supabase.from("brokerage_shipments").select("*").eq("id", z.string().uuid().parse(request.params.id)).maybeSingle(); if (!shipment) return response.status(404).json({ error: "Shipment not found." }); const scope = await teamScope(actor); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id) || shipment.assigned_to === actor.id || (inTeam(scope, shipment.team_id, shipment.assigned_to) && scope.permissions.has("operations.shipments.view_team")); if (!allowed) return response.status(403).json({ error: "Shipment is outside your work scope." }); const { data, error } = await supabase.from("record_comments").insert({ entity_type: "SHIPMENT", entity_id: shipment.id, author_id: actor.id, body: input.body }).select().single(); if (error) throw error; if (shipment.assigned_to && shipment.assigned_to !== actor.id) await supabase.from("notifications").insert({ recipient_id: shipment.assigned_to, kind: "SHIPMENT_COMMENT", title: "New shipment comment", body: input.body.slice(0, 140), entity_type: "SHIPMENT", entity_id: shipment.id }); await writeAudit(supabase, actor.id, "COMMENT_ADDED", "shipment", shipment.id); response.status(201).json({ comment: data }); } catch (error) { next(error); }
 });
 
 app.post("/api/v1/brokerage/department-users", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
