@@ -295,7 +295,7 @@ app.get("/api/v1/brokerage/workspace", requireBrokerageUser, async (request: Bro
     }
     const [{ data: shipments }, { data: quotes }] = await Promise.all([shipmentQuery, sales && leadIds.length ? supabase.from("sales_quotes").select("*").in("lead_id", leadIds).order("updated_at", { ascending: false }) : Promise.resolve({ data: [] })]);
     const operationsAgent = isOperations(actor);
-    response.json({ role: actor.role, department: actor.department, teams, operationsDepartments, permissions: [...permissions], capabilities: { sales, departmentManager, teamLead: leadTeams.length > 0, canCreateLead: sales, canCreateQuote: sales, canManageCustomerShipments: sales, canUpdateShipments: operationsAgent, canRecordShipmentFinance: operationsAgent, canRaiseException: operationsAgent, canReviewQuotes: departmentManager || permissions.has("sales.quotes.review"), canHandoffQuotes: departmentManager || permissions.has("sales.quotes.handoff"), canAssignShipments: departmentManager || permissions.has("operations.shipments.assign"), canReviewDocuments: departmentManager || permissions.has("operations.documents.review"), canResolveExceptions: departmentManager || permissions.has("operations.exceptions.resolve"), canMarkInvoiceReady: departmentManager || permissions.has("operations.billing.mark_invoice_ready") }, leads, quotes, shipments });
+    response.json({ role: actor.role, department: actor.department, teams, operationsDepartments, permissions: [...permissions], capabilities: { sales, departmentManager, teamLead: leadTeams.length > 0, canCreateLead: sales, canCreateQuote: sales, canManageCustomerShipments: sales, canUpdateShipments: operationsAgent, canRecordShipmentFinance: operationsAgent, canRaiseException: operationsAgent, canAssignLeads: departmentManager || permissions.has("sales.leads.assign"), canReviewQuotes: departmentManager || permissions.has("sales.quotes.review"), canHandoffQuotes: departmentManager || permissions.has("sales.quotes.handoff"), canAssignShipments: departmentManager || permissions.has("operations.shipments.assign"), canReviewDocuments: departmentManager || permissions.has("operations.documents.review"), canResolveExceptions: departmentManager || permissions.has("operations.exceptions.resolve"), canMarkInvoiceReady: departmentManager || permissions.has("operations.billing.mark_invoice_ready") }, leads, quotes, shipments });
   } catch (error) { next(error); }
 });
 
@@ -344,12 +344,15 @@ app.post("/api/v1/brokerage/teams", requireBrokerageUser, async (request: Broker
 app.get("/api/v1/brokerage/team-directory", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
   try {
     const actor = request.actor!;
-    if (actor.role !== "MANAGER" || !actor.department_id) return response.status(403).json({ error: "Only a Department Manager can manage teams." });
+    if (!actor.department_id) return response.status(403).json({ error: "Only a Department Manager can manage teams." });
+    // Managers get the department; a Team Lead gets only their own team (names for their team views).
+    const scope = actor.role === "MANAGER" ? null : await teamScope(actor);
+    if (scope && !scope.leadTeamIds.length) return response.status(403).json({ error: "Only a Department Manager or Team Lead can view the team directory." });
     const supabase = adminClient();
-    const [{ data: members, error: membersError }, { data: teams, error: teamsError }] = await Promise.all([
-      supabase.from("profiles").select("id, full_name, email, role, is_active").eq("department_id", actor.department_id).eq("is_active", true).eq("role", "AGENT"),
-      supabase.from("teams").select("id, name, team_lead_id, is_active, team_members(user_id), team_lead_permissions(user_id, permission_key)").eq("department_id", actor.department_id).order("name"),
-    ]);
+    let memberQuery = supabase.from("profiles").select("id, full_name, email, role, is_active").eq("department_id", actor.department_id).eq("is_active", true).eq("role", "AGENT");
+    let teamQuery = supabase.from("teams").select("id, name, team_lead_id, is_active, team_members(user_id), team_lead_permissions(user_id, permission_key)").eq("department_id", actor.department_id).order("name");
+    if (scope) { memberQuery = memberQuery.in("id", scope.memberIds); teamQuery = teamQuery.in("id", scope.leadTeamIds); }
+    const [{ data: members, error: membersError }, { data: teams, error: teamsError }] = await Promise.all([memberQuery, teamQuery]);
     if (membersError || teamsError) throw membersError ?? teamsError;
     response.json({ users: members, teams });
   } catch (error) { next(error); }
@@ -385,6 +388,11 @@ app.patch("/api/v1/brokerage/leads/:id", requireBrokerageUser, async (request: B
       if (lead.stage === "CUSTOMER" || customers || quotes) return response.status(422).json({ error: "This lead has a customer or quote, so its stage follows its quotes and shipments and cannot be changed." });
     }
     if ((input.owner_id || input.team_id !== undefined) && !(isSuper(actor) || isManager(actor) || scope.permissions.has("sales.leads.assign"))) return response.status(403).json({ error: "Lead assignment permission is required." });
+    // A Team Lead assigns within their own team only: to a team member, and to one of their teams.
+    if (!isSuper(actor) && !isManager(actor) && (input.owner_id || input.team_id !== undefined)) {
+      if (input.owner_id && !scope.memberIds.includes(input.owner_id)) return response.status(403).json({ error: "You can assign leads only to members of your team." });
+      if (input.team_id !== undefined && (!input.team_id || !scope.leadTeamIds.includes(input.team_id))) return response.status(403).json({ error: "You can move leads only between your own teams." });
+    }
     if (input.owner_id && !await validDepartmentPeople(lead.department_id, [input.owner_id])) return response.status(422).json({ error: "The lead owner must be an active Sales Agent in this department." });
     if (input.team_id) { const { data: team } = await supabase.from("teams").select("id").eq("id", input.team_id).eq("department_id", lead.department_id).eq("is_active", true).maybeSingle(); if (!team) return response.status(422).json({ error: "The team must be active in this Sales department." }); }
     const leadUpdate = { ...input, contact_email: input.contact_email || null };
@@ -830,6 +838,10 @@ app.patch("/api/v1/brokerage/shipments/:id", requireBrokerageUser, async (reques
     const canRecordFinance = canUpdate;
     const canManageInvoiceReadiness = isSuper(actor) || departmentManager || (inTeam(scope, shipment.team_id, shipment.assigned_to) && scope.permissions.has("operations.billing.mark_invoice_ready"));
     if ((input.assigned_to !== undefined || input.team_id !== undefined) && !canAssign) return response.status(403).json({ error: "Shipment assignment permission is required." });
+    if (!isSuper(actor) && !departmentManager && canAssign) {
+      if (input.assigned_to && !scope.memberIds.includes(input.assigned_to)) return response.status(403).json({ error: "You can assign shipments only to members of your team." });
+      if (input.team_id !== undefined && (!input.team_id || !scope.leadTeamIds.includes(input.team_id))) return response.status(403).json({ error: "You can move shipments only between your own teams." });
+    }
     if (input.status && ["QUOTED", "PAID"].includes(input.status)) return response.status(422).json({ error: "Use the Sales commercial lifecycle or invoice ledger for this status." });
     const changesFinancials = input.amount_quoted !== undefined || input.amount_invoiced !== undefined || input.amount_paid !== undefined || input.payment_status !== undefined || input.pickup_date !== undefined || input.delivery_date !== undefined;
     if ((input.status || input.carrier_name !== undefined || input.note) && !canUpdate) return response.status(403).json({ error: "Shipment update permission is required." });
@@ -893,7 +905,8 @@ app.post("/api/v1/brokerage/shipments/:id/invoice", requireBrokerageUser, async 
     const actor = request.actor!; const supabase = adminClient(); const shipmentId = z.string().uuid().parse(request.params.id);
     const { data: shipment, error } = await supabase.from("brokerage_shipments").select("*").eq("id", shipmentId).single();
     if (error || !shipment) return response.status(404).json({ error: "Shipment not found." });
-    if (!(isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id))) return response.status(403).json({ error: "Only the Operations Manager can generate an invoice." });
+    const billingLead = inTeam(await teamScope(actor), shipment.team_id, shipment.assigned_to) && (await teamScope(actor)).permissions.has("operations.billing.mark_invoice_ready");
+    if (!(isSuper(actor) || (isManager(actor) && actor.department_id === shipment.operations_department_id) || billingLead)) return response.status(403).json({ error: "Only the Operations Manager or a Team Lead with billing access can generate an invoice." });
     if (!['DELIVERED', 'COMPLETED'].includes(shipment.status)) return response.status(422).json({ error: "A shipment must be delivered before invoicing." });
     const input = invoiceSchema.parse(request.body ?? {});
     const { invoice, created } = await ensureInvoice(supabase, shipment, actor.id, input);
@@ -904,9 +917,11 @@ app.post("/api/v1/brokerage/shipments/:id/invoice", requireBrokerageUser, async 
 app.patch("/api/v1/brokerage/invoices/:id", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
   try {
     const actor = request.actor!; const input = invoiceSchema.parse(request.body); const supabase = adminClient(); const invoiceId = z.string().uuid().parse(request.params.id);
-    const { data: invoice, error } = await supabase.from("brokerage_invoices").select("*, brokerage_shipments(operations_department_id)").eq("id", invoiceId).single();
+    const { data: invoice, error } = await supabase.from("brokerage_invoices").select("*, brokerage_shipments(operations_department_id, team_id, assigned_to)").eq("id", invoiceId).single();
     if (error || !invoice) return response.status(404).json({ error: "Invoice not found." }); const shipment: any = Array.isArray((invoice as any).brokerage_shipments) ? (invoice as any).brokerage_shipments[0] : (invoice as any).brokerage_shipments;
-    if (!(isSuper(actor) || (isManager(actor) && actor.department_id === shipment?.operations_department_id))) return response.status(403).json({ error: "Only the Operations Manager can update an invoice." });
+    const leadScope = isManager(actor) ? null : await teamScope(actor);
+    const billingLead = Boolean(leadScope && inTeam(leadScope, shipment?.team_id, shipment?.assigned_to) && leadScope.permissions.has("operations.billing.mark_invoice_ready"));
+    if (!(isSuper(actor) || (isManager(actor) && actor.department_id === shipment?.operations_department_id) || billingLead)) return response.status(403).json({ error: "Only the Operations Manager or a Team Lead with billing access can update an invoice." });
     // Invoice lifecycle (IN-1, BO-6): it must be Sent before it can be pending or paid; Overdue is set automatically.
     if (input.status && input.status !== invoice.status && !(INVOICE_FLOW[invoice.status] ?? []).includes(input.status)) return response.status(422).json({ error: invoice.status === "DRAFT" && ["PENDING", "PAID"].includes(input.status) ? "Mark the invoice as Sent first." : `An invoice can't move from ${invoice.status.toLowerCase()} to ${input.status.toLowerCase()}.` });
     const update: Record<string, unknown> = { ...input }; if (input.status === 'PAID') update.paid_at = new Date().toISOString();
@@ -1086,10 +1101,12 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
     // Current workload (BO-5): open shipments per agent right now, regardless of the date filter.
     // Every active agent is listed, including those with nothing open; unassigned work is reported separately.
     let opsWorkload: { agents: { agent_id: string; name: string; active: number; exceptions: number }[]; unassigned: number } | null = null;
-    if (isSuper(actor) || (isManager(actor) && isOperations(actor))) {
+    const workloadLead = !isSuper(actor) && !isManager(actor) && isOperations(actor) && scope.leadTeamIds.length > 0 && scope.permissions.has("operations.reports.view_team");
+    if (isSuper(actor) || (isManager(actor) && isOperations(actor)) || workloadLead) {
       let agentQuery = supabase.from("profiles").select("id, full_name, department_id, departments!profiles_department_id_fkey(business_unit, function)").eq("role", "AGENT").eq("is_active", true);
       let openQuery = supabase.from("brokerage_shipments").select("id, assigned_to, status, exception_note, exception_resolution").not("operations_department_id", "is", null).not("status", "in", "(DELIVERED,COMPLETED)");
       if (!isSuper(actor)) { agentQuery = agentQuery.eq("department_id", actor.department_id!); openQuery = openQuery.eq("operations_department_id", actor.department_id!); }
+      if (workloadLead) { agentQuery = agentQuery.in("id", scope.memberIds); openQuery = openQuery.or(teamFilter(scope, "assigned_to")); }
       const [{ data: agents }, { data: open }] = await Promise.all([agentQuery, openQuery]);
       const opsPeopleRows = (agents ?? []).filter((person: any) => { const department = Array.isArray(person.departments) ? person.departments[0] : person.departments; return department?.business_unit === "BROKERAGE" && department?.function === "OPERATIONS"; });
       opsWorkload = {
