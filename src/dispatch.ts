@@ -117,9 +117,10 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
     || (isDispatchSales(actor) && isManager(actor) && actor.department_id === carrier.department_id)
     || carrier.owner_id === actor.id
     || lead(scope, "dispatch_sales.carriers.edit_team", carrier.team_id, carrier.owner_id);
+  // A Team Lead never reviews or signs off their own carriers; that goes to the manager.
   const carrierReview = (actor: Actor, scope: Scope, carrier: any) => isSuper(actor)
     || (isDispatchSales(actor) && isManager(actor) && actor.department_id === carrier.department_id)
-    || lead(scope, "dispatch_sales.carriers.review", carrier.team_id, carrier.owner_id);
+    || (carrier.owner_id !== actor.id && lead(scope, "dispatch_sales.carriers.review", carrier.team_id, carrier.owner_id));
   const carrierAssign = (actor: Actor, scope: Scope, carrier: any) => isSuper(actor)
     || (isDispatchSales(actor) && isManager(actor) && actor.department_id === carrier.department_id)
     || lead(scope, "dispatch_sales.carriers.assign", carrier.team_id, carrier.owner_id);
@@ -138,10 +139,10 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
     || lead(scope, "dispatch.trucks.assign", truck.team_id, truck.assigned_to);
   const invoiceReview = (actor: Actor, scope: Scope, invoice: any, truck: any) => isSuper(actor)
     || (isDispatchOps(actor) && isManager(actor) && actor.department_id === invoice.dispatch_department_id)
-    || lead(scope, "dispatch.invoices.review", truck?.team_id, invoice.dispatcher_id);
+    || (invoice.dispatcher_id !== actor.id && lead(scope, "dispatch.invoices.review", truck?.team_id, invoice.dispatcher_id));
   const invoiceSignOff = (actor: Actor, scope: Scope, invoice: any, carrier: any) => isSuper(actor)
     || (isDispatchSales(actor) && isManager(actor) && actor.department_id === invoice.sales_department_id)
-    || lead(scope, "dispatch_sales.invoices.signoff", carrier?.team_id, carrier?.owner_id);
+    || (carrier?.owner_id !== actor.id && lead(scope, "dispatch_sales.invoices.signoff", carrier?.team_id, carrier?.owner_id));
 
   /** A carrier is visible from the Sales side, or from Operations through any of its trucks. */
   const carrierVisible = (actor: Actor, scope: Scope, carrier: any, trucks: any[]) => carrierSalesView(actor, scope, carrier) || trucks.some((truck) => truckOpsView(actor, scope, truck));
