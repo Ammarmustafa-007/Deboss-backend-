@@ -6,6 +6,7 @@ import morgan from "morgan";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { registerPayrollRoutes } from "./payroll.js";
+import { registerDispatchRoutes } from "./dispatch.js";
 
 const port = Number(process.env.PORT ?? 4000);
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -272,6 +273,21 @@ app.patch("/api/v1/users/:id", requireSuperAdmin, async (request, response, next
 app.get("/api/v1/brokerage/workspace", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
   try {
     const actor = request.actor!;
+    // Dispatch users share the app shell; their records load from the Dispatch API, so the workspace only carries
+    // who they are, their teams and what they may do.
+    if (actor.role !== "SUPER_ADMIN" && actor.department?.business_unit === "DISPATCH") {
+      const supabase = adminClient(); const scope = await teamScope(actor);
+      const { data: teams } = await supabase.from("teams").select("id, name, team_lead_id").eq("department_id", actor.department_id ?? "00000000-0000-0000-0000-000000000000");
+      const has = (key: string) => scope.permissions.has(key);
+      const manager = actor.role === "MANAGER"; const sales = actor.department?.function === "SALES";
+      return response.json({ unit: "DISPATCH", role: actor.role, department: actor.department, teams: teams ?? [], permissions: [...scope.permissions], leads: [], quotes: [], shipments: [], capabilities: {
+        dispatch: true, sales, departmentManager: manager, teamLead: scope.leadTeamIds.length > 0,
+        canCreateCarrier: sales, canReviewCarriers: sales && (manager || has("dispatch_sales.carriers.review")), canAssignCarriers: sales && (manager || has("dispatch_sales.carriers.assign")),
+        canSignOffInvoices: sales && (manager || has("dispatch_sales.invoices.signoff")), canAssignTrucks: !sales && (manager || has("dispatch.trucks.assign")),
+        canReviewInvoices: !sales && (manager || has("dispatch.invoices.review")), canSetTargets: manager,
+        teamReports: manager || has(sales ? "dispatch_sales.reports.view_team" : "dispatch.reports.view_team"),
+      } });
+    }
     if (actor.role !== "SUPER_ADMIN" && actor.department?.business_unit !== "BROKERAGE") return response.status(403).json({ error: "Brokerage access is required." });
     const supabase = adminClient();
     const scope = await teamScope(actor);
@@ -324,7 +340,7 @@ app.post("/api/v1/brokerage/quotes", requireBrokerageUser, async (request: Broke
 app.post("/api/v1/brokerage/teams", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
   try {
     const actor = request.actor!; const input = teamSchema.parse(request.body);
-    if (actor.role !== "MANAGER" || actor.department?.business_unit !== "BROKERAGE" || !actor.department_id) return response.status(403).json({ error: "Only a Brokerage Department Manager can create teams." });
+    if (actor.role !== "MANAGER" || !actor.department_id) return response.status(403).json({ error: "Only a Department Manager can create teams." });
     const supabase = adminClient();
     const memberIds = [...new Set([...input.member_ids, ...(input.team_lead_id ? [input.team_lead_id] : [])])];
     if (!await validDepartmentPeople(actor.department_id, memberIds)) return response.status(422).json({ error: "Team members and Team Leads must be active Agents in your department." });
@@ -1238,6 +1254,7 @@ app.patch("/api/v1/brokerage/department-users/:id", requireBrokerageUser, async 
   try { const actor = request.actor!; const userId = z.string().uuid().parse(request.params.id); const input = z.object({ is_active: z.boolean().optional() }).strict().parse(request.body); if (!isManager(actor) || !actor.department_id) return response.status(403).json({ error: "Manager access is required." }); const supabase = adminClient(); const { data: target } = await supabase.from("profiles").select("id, role").eq("id", userId).eq("department_id", actor.department_id).maybeSingle(); if (!target || target.role !== "AGENT") return response.status(404).json({ error: "Agent not found in your department." }); if (input.is_active !== undefined) { const { error } = await supabase.from("profiles").update({ is_active: input.is_active }).eq("id", userId); if (error) throw error; clearAccessCache(userId); await writeAudit(supabase, actor.id, input.is_active ? "ACCESS_RESTORED" : "ACCESS_REVOKED", "profile", userId); } response.json({ ok: true }); } catch (error) { next(error); }
 });
 
+registerDispatchRoutes(app, { adminClient: adminClient as never, requireUser: requireBrokerageUser as never, writeAudit: writeAudit as never, teamScope: teamScope as never, withAuthorDetails: withAuthorDetails as never });
 registerPayrollRoutes(app, { adminClient, requireSuperAdmin: requireSuperAdmin as never, requireBrokerageUser: requireBrokerageUser as never, writeAudit: writeAudit as never });
 
 app.use((_request, response) => response.status(404).json({ error: "Route not found." }));

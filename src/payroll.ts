@@ -21,7 +21,7 @@ type Deps = {
   writeAudit: (supabase: SupabaseClient, actorId: string, action: string, entityType: string, entityId: string, detail?: Record<string, unknown>) => Promise<void>;
 };
 
-export const roleKeys = ["BROKERAGE_SALES_AGENT", "BROKERAGE_SALES_MANAGER", "BROKERAGE_OPERATIONS_AGENT", "BROKERAGE_OPERATIONS_MANAGER"] as const;
+export const roleKeys = ["BROKERAGE_SALES_AGENT", "BROKERAGE_SALES_MANAGER", "BROKERAGE_OPERATIONS_AGENT", "BROKERAGE_OPERATIONS_MANAGER", "DISPATCH_SALES_AGENT", "DISPATCH_SALES_MANAGER", "DISPATCHER", "DISPATCH_MANAGER"] as const;
 type RoleKey = (typeof roleKeys)[number];
 type Basis = "APPROVED_GROSS" | "COLLECTED";
 type Setting = { base_salary: number; commission_rate: number; commission_basis: Basis };
@@ -52,8 +52,17 @@ const shiftPeriod = (period: string, months: number) => {
 };
 
 function roleKeyFor(role: string, department?: { business_unit?: string; function?: string } | null): RoleKey | null {
-  if (department?.business_unit !== "BROKERAGE" || !["AGENT", "MANAGER"].includes(role)) return null;
+  if (!["AGENT", "MANAGER"].includes(role)) return null;
+  if (department?.business_unit === "DISPATCH") return (department.function === "SALES" ? `DISPATCH_SALES_${role}` : role === "AGENT" ? "DISPATCHER" : "DISPATCH_MANAGER") as RoleKey;
+  if (department?.business_unit !== "BROKERAGE") return null;
   return `BROKERAGE_${department.function === "SALES" ? "SALES" : "OPERATIONS"}_${role}` as RoleKey;
+}
+
+/** Dispatch tables arrive with migration 015; until a database has them, payroll and finance simply see no Dispatch rows. */
+async function optional<T>(query: PromiseLike<{ data: T | null; error: any }>): Promise<T> {
+  const { data, error } = await query;
+  if (error && !["PGRST205", "42P01"].includes(error.code)) throw error;
+  return (data ?? []) as T;
 }
 
 async function must<T>(query: PromiseLike<{ data: T | null; error: unknown }>): Promise<T> {
@@ -67,12 +76,15 @@ export async function computePayroll(supabase: SupabaseClient, period: string, o
   const { start, end } = bounds(period);
   let peopleQuery = supabase.from("profiles").select("id, full_name, role, department_id, is_active, departments!profiles_department_id_fkey(id, name, business_unit, function)").in("role", ["AGENT", "MANAGER"]).eq("is_active", true);
   if (onlyUserId) peopleQuery = peopleQuery.eq("id", onlyUserId);
-  const [people, settings, approvedQuotes, issued, paid] = await Promise.all([
+  const [people, settings, approvedQuotes, issued, paid, dispatchSigned, dispatchPaid] = await Promise.all([
     must<any[]>(peopleQuery),
     must<any[]>(supabase.from("compensation_settings").select("role_key, user_id, base_salary, commission_rate, commission_basis")),
     must<any[]>(supabase.from("sales_quotes").select("id, reviewed_at").in("stage", ["APPROVED", "HANDED_OFF"]).gte("reviewed_at", start).lt("reviewed_at", end)),
     must<any[]>(supabase.from("brokerage_invoices").select("id, shipment_id, department_id, amount, issued_at, created_at").gte("issued_at", start).lt("issued_at", end)),
     must<any[]>(supabase.from("brokerage_invoices").select("id, shipment_id, department_id, amount_paid, paid_at").eq("status", "PAID").gte("paid_at", start).lt("paid_at", end)),
+    // Dispatch (PY-5): revenue counts once the Dispatch Sales Manager signs off a paid weekly invoice, or when it is paid.
+    optional<any[]>(supabase.from("dispatch_invoices").select("id, invoice_number, amount, signed_off_at, sales_agent_id, sales_department_id, dispatcher_id, dispatch_department_id, dispatch_carriers(company_name)").not("signed_off_at", "is", null).gte("signed_off_at", start).lt("signed_off_at", end)),
+    optional<any[]>(supabase.from("dispatch_invoices").select("id, invoice_number, amount_paid, paid_at, sales_agent_id, sales_department_id, dispatcher_id, dispatch_department_id, dispatch_carriers(company_name)").eq("status", "PAID").gte("paid_at", start).lt("paid_at", end)),
   ]);
 
   const quoteDate = new Map(approvedQuotes.map((quote) => [quote.id, quote.reviewed_at as string]));
@@ -98,7 +110,17 @@ export async function computePayroll(supabase: SupabaseClient, period: string, o
     const manager = roleKey.endsWith("MANAGER");
     const items: Item[] = [];
 
-    if (setting.commission_basis === "APPROVED_GROSS" && sales) {
+    if (roleKey.startsWith("DISPATCH")) {
+      const dispatchSales = roleKey.startsWith("DISPATCH_SALES");
+      const invoices = setting.commission_basis === "APPROVED_GROSS" ? dispatchSigned : dispatchPaid;
+      for (const invoice of invoices) {
+        const mine = dispatchSales
+          ? (manager ? invoice.sales_department_id === person.department_id : invoice.sales_agent_id === person.id)
+          : (manager ? invoice.dispatch_department_id === person.department_id : invoice.dispatcher_id === person.id);
+        const carrier = Array.isArray(invoice.dispatch_carriers) ? invoice.dispatch_carriers[0] : invoice.dispatch_carriers;
+        if (mine) items.push({ reference: invoice.invoice_number, customer: carrier?.company_name ?? null, amount: num(setting.commission_basis === "APPROVED_GROSS" ? invoice.amount : invoice.amount_paid), date: invoice.signed_off_at ?? invoice.paid_at ?? null });
+      }
+    } else if (setting.commission_basis === "APPROVED_GROSS" && sales) {
       for (const shipment of approvedShipments) {
         const mine = manager ? shipment.sales_department_id === person.department_id : ownerOf.get(shipment.customer_id) === person.id;
         if (mine) items.push({ reference: shipment.reference_number, customer: shipment.customer_name, amount: num(shipment.amount_agreed ?? shipment.amount_quoted), date: quoteDate.get(shipment.quote_id) ?? null });
@@ -151,18 +173,24 @@ async function payrollFor(supabase: SupabaseClient, period: string) {
 
 async function financeFor(supabase: SupabaseClient, period: string) {
   const { start, end } = bounds(period);
-  const [issued, paid, approvedQuotes, payroll] = await Promise.all([
+  const [issued, paid, approvedQuotes, payroll, dispatchIssued, dispatchPaid] = await Promise.all([
     must<any[]>(supabase.from("brokerage_invoices").select("amount, department_id").gte("issued_at", start).lt("issued_at", end)),
     must<any[]>(supabase.from("brokerage_invoices").select("amount_paid, department_id").eq("status", "PAID").gte("paid_at", start).lt("paid_at", end)),
     must<any[]>(supabase.from("sales_quotes").select("id").in("stage", ["APPROVED", "HANDED_OFF"]).gte("reviewed_at", start).lt("reviewed_at", end)),
     payrollFor(supabase, period),
+    // Dispatch weekly invoices count when forwarded to accounting, collections when paid.
+    optional<any[]>(supabase.from("dispatch_invoices").select("amount, sales_department_id, dispatch_department_id").neq("status", "CANCELLED").not("forwarded_at", "is", null).gte("forwarded_at", start).lt("forwarded_at", end)),
+    optional<any[]>(supabase.from("dispatch_invoices").select("amount_paid, sales_department_id, dispatch_department_id").eq("status", "PAID").gte("paid_at", start).lt("paid_at", end)),
   ]);
   const approved = approvedQuotes.length ? await must<any[]>(supabase.from("brokerage_shipments").select("amount_agreed, amount_quoted, sales_department_id").in("quote_id", approvedQuotes.map((quote) => quote.id))) : [];
   const summary = summarize(payroll.lines);
   return {
     period,
-    invoiced: round(issued.reduce((s, i) => s + num(i.amount), 0)),
-    collected: round(paid.reduce((s, i) => s + num(i.amount_paid), 0)),
+    invoiced: round(issued.reduce((s, i) => s + num(i.amount), 0) + dispatchIssued.reduce((s, i) => s + num(i.amount), 0)),
+    collected: round(paid.reduce((s, i) => s + num(i.amount_paid), 0) + dispatchPaid.reduce((s, i) => s + num(i.amount_paid), 0)),
+    dispatch_invoiced: round(dispatchIssued.reduce((s, i) => s + num(i.amount), 0)),
+    dispatch_collected: round(dispatchPaid.reduce((s, i) => s + num(i.amount_paid), 0)),
+    dispatchIssued, dispatchPaid,
     approved_gross: round(approved.reduce((s, x) => s + num(x.amount_agreed ?? x.amount_quoted), 0)),
     payroll: summary.totals.total,
     payroll_status: payroll.status,
@@ -289,12 +317,22 @@ export function registerPayrollRoutes(app: Express, { adminClient, requireSuperA
       const [current, ...history] = await Promise.all([financeFor(supabase, period), ...months.slice(0, 5).map((month) => financeFor(supabase, month))]);
       const [openInvoices, departments] = await Promise.all([
         must<any[]>(supabase.from("brokerage_invoices").select("amount, amount_paid").not("status", "in", "(PAID,CANCELLED)")),
-        must<any[]>(supabase.from("departments").select("id, name, business_unit, function").eq("business_unit", "BROKERAGE").eq("is_active", true).order("name")),
+        must<any[]>(supabase.from("departments").select("id, name, business_unit, function").eq("is_active", true).order("business_unit").order("name")),
       ]);
+      const openDispatch = await optional<any[]>(supabase.from("dispatch_invoices").select("amount, amount_paid").in("status", ["SUBMITTED", "FORWARDED"]));
       const byDepartment = departments.map((department) => {
         const sales = department.function === "SALES";
         const payroll = current.summary.departments.find((row) => row.department_id === department.id);
-        return {
+        if (department.business_unit === "DISPATCH") {
+          const key = sales ? "sales_department_id" : "dispatch_department_id";
+          return {
+            id: department.id, name: department.name, function: department.function, business_unit: department.business_unit,
+            revenue: round(current.dispatchIssued.filter((i) => i[key] === department.id).reduce((s, i) => s + num(i.amount), 0)),
+            collected: round(current.dispatchPaid.filter((i) => i[key] === department.id).reduce((s, i) => s + num(i.amount_paid), 0)),
+            payroll: payroll?.total ?? 0, people: payroll?.people ?? 0,
+          };
+        }
+        return { business_unit: department.business_unit,
           id: department.id, name: department.name, function: department.function,
           revenue: sales ? round(current.approved.filter((x) => x.sales_department_id === department.id).reduce((s, x) => s + num(x.amount_agreed ?? x.amount_quoted), 0)) : round(current.issued.filter((i) => i.department_id === department.id).reduce((s, i) => s + num(i.amount), 0)),
           collected: sales ? null : round(current.paid.filter((i) => i.department_id === department.id).reduce((s, i) => s + num(i.amount_paid), 0)),
@@ -305,7 +343,8 @@ export function registerPayrollRoutes(app: Express, { adminClient, requireSuperA
       response.json({
         period,
         invoiced: current.invoiced, collected: current.collected, approved_gross: current.approved_gross,
-        outstanding: round(openInvoices.reduce((s, i) => s + Math.max(0, num(i.amount) - num(i.amount_paid)), 0)),
+        outstanding: round([...openInvoices, ...openDispatch].reduce((s, i) => s + Math.max(0, num(i.amount) - num(i.amount_paid)), 0)),
+        dispatch_invoiced: current.dispatch_invoiced, dispatch_collected: current.dispatch_collected,
         payroll: current.payroll, payroll_status: current.payroll_status,
         operating_profit: round(current.collected - current.payroll),
         departments: byDepartment,
