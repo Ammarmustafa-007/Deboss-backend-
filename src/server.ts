@@ -7,6 +7,8 @@ import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { registerPayrollRoutes } from "./payroll.js";
 import { registerDispatchRoutes } from "./dispatch.js";
+import { registerChatRoutes, syncTeamGroup } from "./chat.js";
+import { registerFronterRoutes } from "./fronter.js";
 
 const port = Number(process.env.PORT ?? 4000);
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -15,7 +17,8 @@ const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const app = express();
 
 app.use(helmet());
-app.use(cors({ origin: process.env.FRONTEND_URL ?? "http://localhost:3000", credentials: true }));
+// FRONTEND_URL may list several origins, comma-separated.
+app.use(cors({ origin: (process.env.FRONTEND_URL ?? "http://localhost:3000").split(",").map((origin) => origin.trim()), credentials: true }));
 app.use(express.json({ limit: "1mb" }));
 app.use(morgan("dev"));
 
@@ -94,7 +97,9 @@ const updateUserSchema = z.object({ full_name: z.string().trim().min(2).max(100)
 const leadSchema = z.object({ company_name: z.string().trim().min(2), contact_name: z.string().trim().optional(), contact_email: z.string().email().optional().or(z.literal("")), contact_phone: z.string().trim().optional(), estimated_monthly_value: z.number().nonnegative().optional(), next_follow_up_at: z.string().datetime().optional(), source: z.string().trim().optional(), notes: z.string().trim().optional() });
 const quoteSchema = z.object({ lead_id: z.string().uuid(), pickup_location: z.string().trim().min(2), delivery_location: z.string().trim().min(2), equipment_type: z.string().trim().optional(), quoted_rate: z.number().nonnegative().optional() });
 const nullableUuid = z.preprocess((value) => value === "" ? null : value, z.string().uuid().nullable().optional());
-const teamSchema = z.object({ name: z.string().trim().min(2).max(80), team_lead_id: nullableUuid, member_ids: z.array(z.string().uuid()).min(1), permissions: z.array(z.string()).default([]) });
+const teamSchema = z.object({ name: z.string().trim().min(2).max(80), team_lead_id: nullableUuid, member_ids: z.array(z.string().uuid()).min(1), permissions: z.array(z.string()).default([]),
+  // The team's chat group (name and photo); the group's members always follow the team.
+  group_name: z.preprocess((value) => value === "" ? undefined : value, z.string().trim().min(2).max(80).optional()), group_photo_url: z.string().url().max(500).nullable().optional() });
 const teamUpdateSchema = teamSchema.partial().extend({ is_active: z.boolean().optional() });
 const leadUpdateSchema = leadSchema.partial().extend({ stage: z.enum(["NEW", "CONTACTED", "QUALIFIED", "CUSTOMER", "LOST"]).optional(), owner_id: z.string().uuid().optional(), team_id: z.string().uuid().nullable().optional(), archived_at: z.string().datetime().nullable().optional(), estimated_monthly_value: z.number().nonnegative().nullable().optional(), next_follow_up_at: z.string().datetime().nullable().optional() });
 const activitySchema = z.object({ activity_type: z.enum(["CALL", "CALLBACK", "EMAIL", "NOTE", "FOLLOW_UP", "APPOINTMENT"]), body: z.string().trim().min(1).max(3000), due_at: z.string().datetime().nullable().optional() });
@@ -288,6 +293,16 @@ app.get("/api/v1/brokerage/workspace", requireBrokerageUser, async (request: Bro
         teamReports: manager || has(sales ? "dispatch_sales.reports.view_team" : "dispatch.reports.view_team"),
       } });
     }
+    // Fronters work in their own sheets; the workspace only carries who they are and what they may do.
+    if (actor.role !== "SUPER_ADMIN" && actor.department?.business_unit === "BROKERAGE" && actor.department?.function === "FRONTER") {
+      const supabase = adminClient(); const scope = await teamScope(actor);
+      const { data: teams } = await supabase.from("teams").select("id, name, team_lead_id").eq("department_id", actor.department_id ?? "00000000-0000-0000-0000-000000000000");
+      const manager = actor.role === "MANAGER";
+      return response.json({ unit: "FRONTER", role: actor.role, department: actor.department, teams: teams ?? [], permissions: [...scope.permissions], leads: [], quotes: [], shipments: [], capabilities: {
+        fronter: true, sales: false, departmentManager: manager, teamLead: scope.leadTeamIds.length > 0,
+        teamReports: manager || scope.permissions.has("fronter.reports.view_team"), canQualifyTeam: manager || scope.permissions.has("fronter.prospects.qualify"),
+      } });
+    }
     if (actor.role !== "SUPER_ADMIN" && actor.department?.business_unit !== "BROKERAGE") return response.status(403).json({ error: "Brokerage access is required." });
     const supabase = adminClient();
     const scope = await teamScope(actor);
@@ -352,6 +367,7 @@ app.post("/api/v1/brokerage/teams", requireBrokerageUser, async (request: Broker
       const { error: permissionError } = await supabase.from("team_lead_permissions").insert(input.permissions.map((permission_key) => ({ team_id: team.id, user_id: input.team_lead_id, permission_key, granted_by: actor.id })));
       if (permissionError) throw permissionError;
     }
+    await syncTeamGroup(supabase, team.id, { name: input.group_name ?? input.name, photo_url: input.group_photo_url ?? null });
     clearAccessCache(); await writeAudit(supabase, actor.id, "TEAM_CREATED", "team", team.id, { member_count: memberIds.length, team_lead_id: input.team_lead_id ?? null });
     response.status(201).json({ team });
   } catch (error) { next(error); }
@@ -366,7 +382,7 @@ app.get("/api/v1/brokerage/team-directory", requireBrokerageUser, async (request
     if (scope && !scope.leadTeamIds.length) return response.status(403).json({ error: "Only a Department Manager or Team Lead can view the team directory." });
     const supabase = adminClient();
     let memberQuery = supabase.from("profiles").select("id, full_name, email, role, is_active").eq("department_id", actor.department_id).eq("is_active", true).eq("role", "AGENT");
-    let teamQuery = supabase.from("teams").select("id, name, team_lead_id, is_active, team_members(user_id), team_lead_permissions(user_id, permission_key)").eq("department_id", actor.department_id).order("name");
+    let teamQuery = supabase.from("teams").select("id, name, team_lead_id, is_active, team_members(user_id), team_lead_permissions(user_id, permission_key), chat_conversations(id, name, photo_url)").eq("department_id", actor.department_id).order("name");
     if (scope) { memberQuery = memberQuery.in("id", scope.memberIds); teamQuery = teamQuery.in("id", scope.leadTeamIds); }
     const [{ data: members, error: membersError }, { data: teams, error: teamsError }] = await Promise.all([memberQuery, teamQuery]);
     if (membersError || teamsError) throw membersError ?? teamsError;
@@ -380,12 +396,13 @@ app.patch("/api/v1/brokerage/teams/:id", requireBrokerageUser, async (request: B
     if (actor.role !== "MANAGER" || !actor.department_id) return response.status(403).json({ error: "Only a Department Manager can edit teams." });
     const supabase = adminClient(); const { data: existing, error: existingError } = await supabase.from("teams").select("id, team_lead_id").eq("id", teamId).eq("department_id", actor.department_id).eq("manager_id", actor.id).single();
     if (existingError || !existing) return response.status(404).json({ error: "Team not found." });
-    const { member_ids, permissions, ...teamUpdate } = input;
+    const { member_ids, permissions, group_name, group_photo_url, ...teamUpdate } = input;
     if (Object.keys(teamUpdate).length) { const { error } = await supabase.from("teams").update(teamUpdate).eq("id", teamId); if (error) throw error; }
     const teamLeadId = input.team_lead_id === undefined ? existing.team_lead_id : input.team_lead_id;
     if (member_ids) { const merged = [...new Set([...member_ids, ...(teamLeadId ? [teamLeadId] : [])])]; if (!await validDepartmentPeople(actor.department_id, merged)) return response.status(422).json({ error: "Team members must belong to your department." }); await supabase.from("team_members").delete().eq("team_id", teamId); const { error } = await supabase.from("team_members").insert(merged.map((user_id) => ({ team_id: teamId, user_id }))); if (error) throw error; }
     const leadChanged = input.team_lead_id !== undefined && input.team_lead_id !== existing.team_lead_id;
     if (permissions !== undefined || leadChanged) { await supabase.from("team_lead_permissions").delete().eq("team_id", teamId); const delegatedPermissions = permissions ?? []; if (teamLeadId && delegatedPermissions.length) { const { error } = await supabase.from("team_lead_permissions").insert(delegatedPermissions.map((permission_key) => ({ team_id: teamId, user_id: teamLeadId, permission_key, granted_by: actor.id }))); if (error) throw error; } }
+    await syncTeamGroup(supabase, teamId, { ...(group_name !== undefined ? { name: group_name } : {}), ...(group_photo_url !== undefined ? { photo_url: group_photo_url } : {}) });
     clearAccessCache(); await writeAudit(supabase, actor.id, "TEAM_UPDATED", "team", teamId);
     response.json({ ok: true });
   } catch (error) { next(error); }
@@ -479,7 +496,9 @@ app.get("/api/v1/brokerage/leads/:id/detail", requireBrokerageUser, async (reque
     if (error || !lead) return response.status(404).json({ error: "Lead not found." }); const scope = await teamScope(actor); const teamReadable = inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.view_team"); const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || teamReadable;
     if (!allowed) return response.status(403).json({ error: "Lead is outside your work scope." }); const [activities, comments, customer, quotes] = await Promise.all([supabase.from("lead_activities").select("*").eq("lead_id", lead.id).order("created_at", { ascending: false }), supabase.from("record_comments").select("*").eq("entity_type", "LEAD").eq("entity_id", lead.id).order("created_at", { ascending: false }), supabase.from("brokerage_customers").select("*").eq("lead_id", lead.id).maybeSingle(), supabase.from("sales_quotes").select("*").eq("lead_id", lead.id).order("updated_at", { ascending: false })]);
     const canManage = isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id);
-    response.json({ lead, activities: await withAuthorDetails(supabase, activities.data ?? [], actor.id, canManage), comments: await withAuthorDetails(supabase, comments.data ?? [], actor.id, canManage), customer: customer.data ?? null, quotes: quotes.data ?? [] });
+    // Leads mined by Fronters carry the mined details (addresses, billing, EIN, W-9, lanes) for the Sales agent.
+    const { data: prospect } = lead.fronter_prospect_id ? await supabase.from("fronter_prospects").select("*, profiles!fronter_prospects_created_by_fkey(full_name)").eq("id", lead.fronter_prospect_id).maybeSingle() : { data: null };
+    response.json({ prospect: prospect ? { ...prospect, fronter_name: (Array.isArray((prospect as any).profiles) ? (prospect as any).profiles[0] : (prospect as any).profiles)?.full_name ?? null, profiles: undefined } : null, lead, activities: await withAuthorDetails(supabase, activities.data ?? [], actor.id, canManage), comments: await withAuthorDetails(supabase, comments.data ?? [], actor.id, canManage), customer: customer.data ?? null, quotes: quotes.data ?? [] });
   } catch (error) { next(error); }
 });
 
@@ -1254,6 +1273,8 @@ app.patch("/api/v1/brokerage/department-users/:id", requireBrokerageUser, async 
   try { const actor = request.actor!; const userId = z.string().uuid().parse(request.params.id); const input = z.object({ is_active: z.boolean().optional() }).strict().parse(request.body); if (!isManager(actor) || !actor.department_id) return response.status(403).json({ error: "Manager access is required." }); const supabase = adminClient(); const { data: target } = await supabase.from("profiles").select("id, role").eq("id", userId).eq("department_id", actor.department_id).maybeSingle(); if (!target || target.role !== "AGENT") return response.status(404).json({ error: "Agent not found in your department." }); if (input.is_active !== undefined) { const { error } = await supabase.from("profiles").update({ is_active: input.is_active }).eq("id", userId); if (error) throw error; clearAccessCache(userId); await writeAudit(supabase, actor.id, input.is_active ? "ACCESS_RESTORED" : "ACCESS_REVOKED", "profile", userId); } response.json({ ok: true }); } catch (error) { next(error); }
 });
 
+registerChatRoutes(app, { adminClient: adminClient as never, requireUser: requireBrokerageUser as never, requireSuperAdmin: requireSuperAdmin as never, writeAudit: writeAudit as never });
+registerFronterRoutes(app, { adminClient: adminClient as never, requireUser: requireBrokerageUser as never, writeAudit: writeAudit as never, teamScope: teamScope as never });
 registerDispatchRoutes(app, { adminClient: adminClient as never, requireUser: requireBrokerageUser as never, writeAudit: writeAudit as never, teamScope: teamScope as never, withAuthorDetails: withAuthorDetails as never });
 registerPayrollRoutes(app, { adminClient, requireSuperAdmin: requireSuperAdmin as never, requireBrokerageUser: requireBrokerageUser as never, writeAudit: writeAudit as never });
 

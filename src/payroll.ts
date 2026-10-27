@@ -21,7 +21,7 @@ type Deps = {
   writeAudit: (supabase: SupabaseClient, actorId: string, action: string, entityType: string, entityId: string, detail?: Record<string, unknown>) => Promise<void>;
 };
 
-export const roleKeys = ["BROKERAGE_SALES_AGENT", "BROKERAGE_SALES_MANAGER", "BROKERAGE_OPERATIONS_AGENT", "BROKERAGE_OPERATIONS_MANAGER", "DISPATCH_SALES_AGENT", "DISPATCH_SALES_MANAGER", "DISPATCHER", "DISPATCH_MANAGER"] as const;
+export const roleKeys = ["BROKERAGE_SALES_AGENT", "BROKERAGE_SALES_MANAGER", "BROKERAGE_OPERATIONS_AGENT", "BROKERAGE_OPERATIONS_MANAGER", "DISPATCH_SALES_AGENT", "DISPATCH_SALES_MANAGER", "DISPATCHER", "DISPATCH_MANAGER", "BROKERAGE_FRONTER_AGENT", "BROKERAGE_FRONTER_MANAGER"] as const;
 type RoleKey = (typeof roleKeys)[number];
 type Basis = "APPROVED_GROSS" | "COLLECTED";
 type Setting = { base_salary: number; commission_rate: number; commission_basis: Basis };
@@ -55,6 +55,7 @@ function roleKeyFor(role: string, department?: { business_unit?: string; functio
   if (!["AGENT", "MANAGER"].includes(role)) return null;
   if (department?.business_unit === "DISPATCH") return (department.function === "SALES" ? `DISPATCH_SALES_${role}` : role === "AGENT" ? "DISPATCHER" : "DISPATCH_MANAGER") as RoleKey;
   if (department?.business_unit !== "BROKERAGE") return null;
+  if (department.function === "FRONTER") return `BROKERAGE_FRONTER_${role}` as RoleKey;
   return `BROKERAGE_${department.function === "SALES" ? "SALES" : "OPERATIONS"}_${role}` as RoleKey;
 }
 
@@ -93,8 +94,15 @@ export async function computePayroll(supabase: SupabaseClient, period: string, o
   const invoiceShipments = invoiceShipmentIds.length ? await must<any[]>(supabase.from("brokerage_shipments").select("id, reference_number, customer_name, customer_id, sales_department_id, operations_department_id, assigned_to").in("id", invoiceShipmentIds)) : [];
   const shipmentById = new Map(invoiceShipments.map((shipment) => [shipment.id, shipment]));
   const customerIds = [...new Set([...approvedShipments, ...invoiceShipments].map((shipment) => shipment.customer_id).filter(Boolean))];
-  const customers = customerIds.length ? await must<any[]>(supabase.from("brokerage_customers").select("id, owner_id").in("id", customerIds)) : [];
+  const customers = customerIds.length ? await must<any[]>(supabase.from("brokerage_customers").select("id, owner_id, lead_id").in("id", customerIds)) : [];
   const ownerOf = new Map(customers.map((customer) => [customer.id, customer.owner_id as string]));
+  // Fronter credit: a customer whose lead was mined by a Fronter counts for that Fronter (and their department).
+  const leadIds = customers.map((customer) => customer.lead_id).filter(Boolean);
+  const minedLeads = leadIds.length ? await optional<any[]>(supabase.from("sales_leads").select("id, fronter_prospect_id").in("id", leadIds).not("fronter_prospect_id", "is", null)) : [];
+  const prospects = minedLeads.length ? await optional<any[]>(supabase.from("fronter_prospects").select("id, created_by, department_id").in("id", minedLeads.map((row) => row.fronter_prospect_id))) : [];
+  const prospectOf = new Map(prospects.map((row) => [row.id, row]));
+  const fronterOfLead = new Map(minedLeads.map((row) => [row.id, prospectOf.get(row.fronter_prospect_id)]));
+  const fronterOf = new Map(customers.map((customer) => [customer.id, fronterOfLead.get(customer.lead_id) as { created_by: string; department_id: string } | undefined]));
 
   const roleDefaults = new Map(settings.filter((setting) => setting.role_key).map((setting) => [setting.role_key, setting]));
   const personal = new Map(settings.filter((setting) => setting.user_id).map((setting) => [setting.user_id, setting]));
@@ -110,7 +118,14 @@ export async function computePayroll(supabase: SupabaseClient, period: string, o
     const manager = roleKey.endsWith("MANAGER");
     const items: Item[] = [];
 
-    if (roleKey.startsWith("DISPATCH")) {
+    if (roleKey.startsWith("BROKERAGE_FRONTER")) {
+      const mine = (customerId: string) => { const fronter = fronterOf.get(customerId); return Boolean(fronter && (manager ? fronter.department_id === person.department_id : fronter.created_by === person.id)); };
+      if (setting.commission_basis === "APPROVED_GROSS") {
+        for (const shipment of approvedShipments) if (mine(shipment.customer_id)) items.push({ reference: shipment.reference_number, customer: shipment.customer_name, amount: num(shipment.amount_agreed ?? shipment.amount_quoted), date: quoteDate.get(shipment.quote_id) ?? null });
+      } else {
+        for (const invoice of paid) { const shipment = shipmentById.get(invoice.shipment_id); if (shipment && mine(shipment.customer_id)) items.push({ reference: shipment.reference_number, customer: shipment.customer_name, amount: num(invoice.amount_paid), date: invoice.paid_at ?? null }); }
+      }
+    } else if (roleKey.startsWith("DISPATCH")) {
       const dispatchSales = roleKey.startsWith("DISPATCH_SALES");
       const invoices = setting.commission_basis === "APPROVED_GROSS" ? dispatchSigned : dispatchPaid;
       for (const invoice of invoices) {
