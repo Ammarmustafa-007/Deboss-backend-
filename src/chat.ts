@@ -8,7 +8,10 @@ import { z } from "zod";
  *    A manager can start a message with agents of their own department; an agent can message any manager.
  *  - Groups: one per team, created and kept in sync from the team form. The team's manager is the group admin
  *    (rename, photo, members); nobody can leave. Messages can't be edited or deleted.
- *  - The Super Admin is not in chats; the Communication page lists every group and its members.
+ *  - Channels (client flow v2, section 8): Quotes (Brokerage Sales + Operations), Updates (also Fronters) and Company
+ *    announcements (everyone reads; managers and the Super Admin post). Membership follows the person's department and is
+ *    synced on every inbox load. Key Brokerage events are posted into Quotes / Updates as EVENT messages (postEvent).
+ *  - The Super Admin takes part only in Company announcements; the Communication page lists every group and its members.
  * Messages are inserted and received directly by the browser through Supabase (row-level security + Realtime);
  * this API handles who may talk to whom, the inbox, history and group settings.
  */
@@ -26,6 +29,22 @@ type Deps = {
 const uuid = z.string().uuid();
 const one = <T,>(value: T | T[] | null | undefined) => (Array.isArray(value) ? value[0] : value) ?? null;
 const directKey = (a: string, b: string) => [a, b].sort().join(":");
+
+/** Channels a person belongs to: Quotes (Brokerage Sales + Operations), Updates (also Fronters), announcements (everyone). */
+export function channelsFor(actor: { role: string; department?: { business_unit: string; function: string } | null }) {
+  if (actor.role === "SUPER_ADMIN") return ["ANNOUNCEMENTS"];
+  const brokerage = actor.department?.business_unit === "BROKERAGE";
+  const fn = actor.department?.function;
+  return ["ANNOUNCEMENTS", ...(brokerage && (fn === "SALES" || fn === "OPERATIONS") ? ["QUOTES"] : []), ...(brokerage && ["SALES", "OPERATIONS", "FRONTER"].includes(fn ?? "") ? ["UPDATES"] : [])];
+}
+
+/** Posts a system update into a channel (Quotes or Updates). Never mention a carrier's identity: Sales reads these. */
+export async function postEvent(supabase: SupabaseClient, channel: "QUOTES" | "UPDATES", actorId: string, body: string) {
+  try {
+    const { data: conversation } = await supabase.from("chat_conversations").select("id").eq("channel_key", channel).maybeSingle();
+    if (conversation) await supabase.from("chat_messages").insert({ conversation_id: conversation.id, sender_id: actorId, body: body.slice(0, 4000), kind: "EVENT" });
+  } catch { /* a channel post never blocks the action it reports */ }
+}
 
 /** Group membership mirrors the team: every member, the team lead and the team's manager (admin). */
 export async function syncTeamGroup(supabase: SupabaseClient, teamId: string, settings: { name?: string | null; photo_url?: string | null } = {}) {
@@ -59,11 +78,21 @@ export function registerChatRoutes(app: Express, deps: Deps) {
 
   function chatUser(request: Req, response: Response, next: NextFunction) {
     const actor = request.actor!;
-    if (actor.role === "SUPER_ADMIN") return response.status(403).json({ error: "The Super Admin sees chats on the Communication page." });
+    if (actor.role === "SUPER_ADMIN") return next(); // Company announcements only (see channelsFor).
     if (!["MANAGER", "AGENT"].includes(actor.role) || !actor.department_id) return response.status(403).json({ error: "Chat is available to managers and agents." });
     return next();
   }
   const guard = [requireUser, chatUser] as Handler[];
+
+  /** Keeps the person's channel memberships in line with their role and department (joins quietly, from now on). */
+  async function syncChannels(supabase: SupabaseClient, actor: Actor) {
+    const { data: channels } = await supabase.from("chat_conversations").select("id, channel_key").eq("kind", "CHANNEL");
+    const allowed = new Set(channelsFor(actor));
+    const join = (channels ?? []).filter((channel: any) => allowed.has(channel.channel_key)).map((channel: any) => ({ conversation_id: channel.id, user_id: actor.id, role: "MEMBER" }));
+    const leave = (channels ?? []).filter((channel: any) => !allowed.has(channel.channel_key)).map((channel: any) => channel.id);
+    if (join.length) await supabase.from("chat_members").upsert(join, { onConflict: "conversation_id,user_id", ignoreDuplicates: true });
+    if (leave.length) await supabase.from("chat_members").delete().eq("user_id", actor.id).in("conversation_id", leave);
+  }
 
   /** Who this person may start a direct message with. */
   async function contactsFor(supabase: SupabaseClient, actor: Actor) {
@@ -81,12 +110,13 @@ export function registerChatRoutes(app: Express, deps: Deps) {
   app.get("/api/v1/chat/inbox", ...guard, async (request: Req, response, next) => {
     try {
       const actor = request.actor!; const supabase = adminClient();
+      await syncChannels(supabase, actor);
       const { data: memberships } = await supabase.from("chat_members").select("conversation_id, role, last_read_at").eq("user_id", actor.id);
       const ids = (memberships ?? []).map((row: any) => row.conversation_id);
       const [{ data: conversations }, { data: members }, contacts] = await Promise.all([
         ids.length ? supabase.from("chat_conversations").select("*").in("id", ids) : Promise.resolve({ data: [] as any[] }),
         ids.length ? supabase.from("chat_members").select("conversation_id, user_id, role, last_read_at, profiles(full_name, role)").in("conversation_id", ids) : Promise.resolve({ data: [] as any[] }),
-        contactsFor(supabase, actor),
+        actor.role === "SUPER_ADMIN" ? Promise.resolve([]) : contactsFor(supabase, actor),
       ]);
       // Last message and unread count per conversation.
       const summaries = await Promise.all((conversations ?? []).map(async (conversation: any) => {
@@ -99,7 +129,9 @@ export function registerChatRoutes(app: Express, deps: Deps) {
         const other = conversation.kind === "DIRECT" ? people.find((person: any) => person.id !== actor.id) : null;
         return {
           id: conversation.id, kind: conversation.kind, team_id: conversation.team_id,
-          name: conversation.kind === "GROUP" ? conversation.name : other?.full_name ?? "Conversation",
+          name: conversation.kind === "DIRECT" ? other?.full_name ?? "Conversation" : conversation.name,
+          channel_key: conversation.channel_key ?? null,
+          can_post: conversation.channel_key !== "ANNOUNCEMENTS" || ["MANAGER", "SUPER_ADMIN"].includes(actor.role),
           photo_url: conversation.photo_url, last_message: last ?? null, last_message_at: conversation.last_message_at ?? conversation.created_at,
           unread: count ?? 0, my_role: mine?.role ?? "MEMBER", members: people, other,
         };
@@ -113,6 +145,7 @@ export function registerChatRoutes(app: Express, deps: Deps) {
   app.post("/api/v1/chat/direct", ...guard, async (request: Req, response, next) => {
     try {
       const actor = request.actor!; const { user_id } = z.object({ user_id: uuid }).parse(request.body); const supabase = adminClient();
+      if (actor.role === "SUPER_ADMIN") return response.status(403).json({ error: "The Super Admin uses Company announcements, not direct messages." });
       if (user_id === actor.id) return response.status(422).json({ error: "Choose someone else." });
       const { data: other } = await supabase.from("profiles").select("id, role, department_id, is_active").eq("id", user_id).maybeSingle();
       if (!other || !mayDirect(actor, other)) return response.status(403).json({ error: actor.role === "AGENT" ? "Agents can message managers directly; talk with other agents in your team group." : "You can't start a direct message with this person." });
@@ -137,7 +170,7 @@ export function registerChatRoutes(app: Express, deps: Deps) {
       const { before } = z.object({ before: z.string().datetime().optional() }).parse(request.query);
       const { data: member } = await supabase.from("chat_members").select("user_id").eq("conversation_id", id).eq("user_id", actor.id).maybeSingle();
       if (!member) return response.status(403).json({ error: "You're not in this conversation." });
-      let query = supabase.from("chat_messages").select("id, conversation_id, sender_id, body, created_at").eq("conversation_id", id).order("created_at", { ascending: false }).limit(60);
+      let query = supabase.from("chat_messages").select("id, conversation_id, sender_id, body, kind, created_at").eq("conversation_id", id).order("created_at", { ascending: false }).limit(60);
       if (before) query = query.lt("created_at", before);
       const { data, error } = await query; if (error) throw error;
       response.json({ messages: (data ?? []).reverse(), has_more: (data ?? []).length === 60 });
