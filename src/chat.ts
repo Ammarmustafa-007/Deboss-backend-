@@ -88,7 +88,9 @@ export function registerChatRoutes(app: Express, deps: Deps) {
   async function syncChannels(supabase: SupabaseClient, actor: Actor) {
     const { data: channels } = await supabase.from("chat_conversations").select("id, channel_key").eq("kind", "CHANNEL");
     const allowed = new Set(channelsFor(actor));
-    const join = (channels ?? []).filter((channel: any) => allowed.has(channel.channel_key)).map((channel: any) => ({ conversation_id: channel.id, user_id: actor.id, role: "MEMBER" }));
+    // Earlier announcements count as unread for someone who joins later (so they see the badge); Quotes and Updates
+    // history doesn't, so joining never floods anyone with old load updates.
+    const join = (channels ?? []).filter((channel: any) => allowed.has(channel.channel_key)).map((channel: any) => ({ conversation_id: channel.id, user_id: actor.id, role: "MEMBER", ...(channel.channel_key === "ANNOUNCEMENTS" ? { last_read_at: "1970-01-01T00:00:00Z" } : {}) }));
     const leave = (channels ?? []).filter((channel: any) => !allowed.has(channel.channel_key)).map((channel: any) => channel.id);
     if (join.length) await supabase.from("chat_members").upsert(join, { onConflict: "conversation_id,user_id", ignoreDuplicates: true });
     if (leave.length) await supabase.from("chat_members").delete().eq("user_id", actor.id).in("conversation_id", leave);
