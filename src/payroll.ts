@@ -89,7 +89,8 @@ export async function computePayroll(supabase: SupabaseClient, period: string, o
   ]);
 
   const quoteDate = new Map(approvedQuotes.map((quote) => [quote.id, quote.reviewed_at as string]));
-  const approvedShipments = quoteDate.size ? await must<any[]>(supabase.from("brokerage_shipments").select("id, quote_id, reference_number, customer_name, customer_id, sales_department_id, amount_agreed, amount_quoted").in("quote_id", [...quoteDate.keys()])) : [];
+  // Cancelled loads earn no commission, even if their rate was approved first.
+  const approvedShipments = quoteDate.size ? (await must<any[]>(supabase.from("brokerage_shipments").select("id, quote_id, reference_number, customer_name, customer_id, sales_department_id, amount_agreed, amount_quoted, status, sales_status").in("quote_id", [...quoteDate.keys()]))).filter((row) => row.status !== "CANCELLED" && row.sales_status !== "CANCELLED") : [];
   const invoiceShipmentIds = [...new Set([...issued, ...paid].map((invoice) => invoice.shipment_id))];
   const invoiceShipments = invoiceShipmentIds.length ? await must<any[]>(supabase.from("brokerage_shipments").select("id, reference_number, customer_name, customer_id, sales_department_id, operations_department_id, assigned_to").in("id", invoiceShipmentIds)) : [];
   const shipmentById = new Map(invoiceShipments.map((shipment) => [shipment.id, shipment]));
@@ -197,7 +198,7 @@ async function financeFor(supabase: SupabaseClient, period: string) {
     optional<any[]>(supabase.from("dispatch_invoices").select("amount, sales_department_id, dispatch_department_id").neq("status", "CANCELLED").not("forwarded_at", "is", null).gte("forwarded_at", start).lt("forwarded_at", end)),
     optional<any[]>(supabase.from("dispatch_invoices").select("amount_paid, sales_department_id, dispatch_department_id").eq("status", "PAID").gte("paid_at", start).lt("paid_at", end)),
   ]);
-  const approved = approvedQuotes.length ? await must<any[]>(supabase.from("brokerage_shipments").select("amount_agreed, amount_quoted, sales_department_id").in("quote_id", approvedQuotes.map((quote) => quote.id))) : [];
+  const approved = approvedQuotes.length ? (await must<any[]>(supabase.from("brokerage_shipments").select("amount_agreed, amount_quoted, sales_department_id, status, sales_status").in("quote_id", approvedQuotes.map((quote) => quote.id)))).filter((row) => row.status !== "CANCELLED" && row.sales_status !== "CANCELLED") : [];
   const summary = summarize(payroll.lines);
   return {
     period,

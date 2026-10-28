@@ -22,6 +22,9 @@ type Deps = {
 
 const uuid = z.string().uuid();
 const text = (max: number) => z.preprocess((value) => value === "" || value === undefined ? null : typeof value === "number" ? String(value) : value, z.string().trim().max(max).nullable()).optional();
+/** Company details shared by a mined prospect and the Sales lead it becomes (see migration 018). */
+export const leadDetailKeys = ["operator_name", "operator_number", "truck_type", "load_type", "shipping_volume", "commodity", "lanes", "physical_address", "other_locations", "billing_address", "billing_contact", "billing_phone", "billing_email", "payment_terms", "w9_received", "ein", "website"] as const;
+
 export const prospectStatuses = ["NEW", "CONTACTED", "NOT_QUALIFIED", "NOT_INTERESTED", "QUALIFIED"] as const;
 const prospectFields = {
   company_name: z.string().trim().min(1).max(180),
@@ -124,13 +127,17 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
         if (!qualifier) return response.status(403).json({ error: "You can't qualify this prospect." });
         if (!next_.assigned_to) return response.status(422).json({ error: "Choose a Sales agent in “Assign to” before qualifying." });
         const { data: owner } = await supabase.from("profiles").select("id, department_id").eq("id", next_.assigned_to).single();
-        const details = [next_.operator_name && `Operator: ${next_.operator_name}${next_.operator_number ? ` (${next_.operator_number})` : ""}`, next_.truck_type && `Truck type: ${next_.truck_type}`, next_.load_type && `Load type: ${next_.load_type}`, next_.shipping_volume && `Shipping volume: ${next_.shipping_volume}`, next_.commodity && `Commodity: ${next_.commodity}`, next_.lanes && `Lanes: ${next_.lanes}`, next_.notes].filter(Boolean).join("\n");
+        // The lead takes over everything the Fronter collected, so Sales sees and edits it on the lead itself.
+        const { data: membership } = await supabase.from("team_members").select("team_id").eq("user_id", next_.assigned_to).limit(1).maybeSingle();
         const { data: created, error: leadError } = await supabase.from("sales_leads").insert({
-          department_id: owner!.department_id, owner_id: next_.assigned_to, company_name: next_.company_name,
+          department_id: owner!.department_id, owner_id: next_.assigned_to, team_id: membership?.team_id ?? null, company_name: next_.company_name,
           contact_name: next_.shipping_contact || next_.operator_name || null, contact_email: next_.email || null, contact_phone: next_.phone || null,
-          stage: "QUALIFIED", source: `Fronter${next_.source ? ` · ${next_.source}` : ""}`, notes: details || null, fronter_prospect_id: row.id,
+          stage: "QUALIFIED", source: `Fronter${next_.source ? ` · ${next_.source}` : ""}`, notes: next_.notes || null, fronter_prospect_id: row.id,
+          ...Object.fromEntries(leadDetailKeys.map((key) => [key, (next_ as any)[key] ?? (key === "w9_received" ? false : null)])),
         }).select("id").single();
         if (leadError) throw leadError;
+        // A Qualified lead gets its customer profile straight away (client flow v2).
+        await supabase.from("brokerage_customers").upsert({ lead_id: created.id, sales_department_id: owner!.department_id, owner_id: next_.assigned_to, company_name: next_.company_name, contact_name: next_.shipping_contact || next_.operator_name || null, contact_email: next_.email || null, contact_phone: next_.phone || null }, { onConflict: "lead_id" });
         const { data, error } = await supabase.from("fronter_prospects").update({ ...fields, assigned_to: next_.assigned_to, status: "QUALIFIED", lead_id: created.id, qualified_by: actor.id, qualified_at: new Date().toISOString() }).eq("id", row.id).select().single(); if (error) throw error;
         const { data: managers } = await supabase.from("profiles").select("id").eq("department_id", owner!.department_id).eq("role", "MANAGER").eq("is_active", true);
         const recipients = [...new Set([next_.assigned_to, ...(managers ?? []).map((manager: any) => manager.id)])].filter((id) => id !== actor.id);
@@ -218,10 +225,11 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
         supabase.from("brokerage_customers").select("id, lead_id").in("lead_id", leadIds),
       ]) : [{ data: [] as any[] }, { data: [] as any[] }];
       const customerIds = (customers ?? []).map((row: any) => row.id);
-      const { data: shipments } = customerIds.length ? await supabase.from("brokerage_shipments").select("customer_id, sales_status, amount_agreed, amount_quoted").in("customer_id", customerIds) : { data: [] as any[] };
+      const { data: shipments } = customerIds.length ? await supabase.from("brokerage_shipments").select("customer_id, sales_status, amount_agreed, amount_quoted, sales_quotes(stage)").in("customer_id", customerIds) : { data: [] as any[] };
       const customerOfLead = new Map((customers ?? []).map((row: any) => [row.lead_id, row.id]));
       const grossOfCustomer = new Map<string, number>();
-      (shipments ?? []).forEach((row: any) => { if (["BOOKED", "DELIVERED", "PAID"].includes(row.sales_status)) grossOfCustomer.set(row.customer_id, (grossOfCustomer.get(row.customer_id) ?? 0) + Number(row.amount_agreed ?? row.amount_quoted ?? 0)); });
+      // Same rule as payroll: a load counts once a Sales Manager has approved its rate (or it has moved on from there).
+      (shipments ?? []).forEach((row: any) => { const quote = Array.isArray(row.sales_quotes) ? row.sales_quotes[0] : row.sales_quotes; if (row.sales_status !== "CANCELLED" && (["APPROVED", "HANDED_OFF"].includes(quote?.stage) || ["BOOKED", "DELIVERED", "PAID"].includes(row.sales_status))) grossOfCustomer.set(row.customer_id, (grossOfCustomer.get(row.customer_id) ?? 0) + Number(row.amount_agreed ?? row.amount_quoted ?? 0)); });
       const stageOf = new Map((leads ?? []).map((row: any) => [row.id, row.stage]));
       const people = await names(supabase, rows.map((row: any) => row.created_by));
       const round = (value: number) => Math.round(value * 100) / 100;
@@ -229,7 +237,8 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
       const byPerson = personIds.map((id) => {
         const mine = rows.filter((row: any) => row.created_by === id);
         const qualified = mine.filter((row: any) => row.status === "QUALIFIED");
-        const won = qualified.filter((row: any) => row.lead_id && (stageOf.get(row.lead_id) === "CUSTOMER" || customerOfLead.has(row.lead_id)));
+        // "Became a customer" is the Customer status (an agreed rate), not just having a profile: Qualified leads get one at once.
+        const won = qualified.filter((row: any) => row.lead_id && stageOf.get(row.lead_id) === "CUSTOMER");
         return {
           id, name: people.get(id) ?? "Unknown", prospects: mine.length,
           ...Object.fromEntries(prospectStatuses.map((status) => [status.toLowerCase(), mine.filter((row: any) => row.status === status).length])),
