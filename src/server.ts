@@ -1535,7 +1535,7 @@ app.patch("/api/v1/brokerage/department-users/:id", requireBrokerageUser, async 
 registerChatRoutes(app, { adminClient: adminClient as never, requireUser: requireBrokerageUser as never, requireSuperAdmin: requireSuperAdmin as never, writeAudit: writeAudit as never });
 registerFronterRoutes(app, { adminClient: adminClient as never, requireUser: requireBrokerageUser as never, writeAudit: writeAudit as never, teamScope: teamScope as never });
 registerDispatchRoutes(app, { adminClient: adminClient as never, requireUser: requireBrokerageUser as never, writeAudit: writeAudit as never, teamScope: teamScope as never, withAuthorDetails: withAuthorDetails as never });
-registerPayrollRoutes(app, { adminClient, requireSuperAdmin: requireSuperAdmin as never, requireBrokerageUser: requireBrokerageUser as never, writeAudit: writeAudit as never });
+registerPayrollRoutes(app, { adminClient, requireSuperAdmin: requireSuperAdmin as never, requireBrokerageUser: requireBrokerageUser as never, clearAccessCache, writeAudit: writeAudit as never });
 
 app.use((_request, response) => response.status(404).json({ error: "Route not found." }));
 app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
