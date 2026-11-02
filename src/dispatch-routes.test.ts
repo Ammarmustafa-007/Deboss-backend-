@@ -86,12 +86,18 @@ test("typed figures override the calculation", async () => {
 });
 
 test("after submitting, only the Dispatch Manager edits, even once paid", async () => {
+  // Submit, recall to change it, and send it again.
+  assert.equal((await call(people.dispatcher, `/api/v1/dispatch/invoices/${first}/actions`, "POST", { action: "SUBMIT" })).status, 200);
+  assert.equal((await call(people.dispatcher, `/api/v1/dispatch/invoices/${first}/actions`, "POST", { action: "RECALL" })).status, 200);
+  assert.equal(invoice(first).status, "DRAFT");
+  assert.equal((await call(people.dispatcher, `/api/v1/dispatch/invoices/${first}`, "PATCH", { amount: 175 })).status, 200);
   assert.equal((await call(people.dispatcher, `/api/v1/dispatch/invoices/${first}/actions`, "POST", { action: "SUBMIT" })).status, 200);
   assert.equal((await call(people.dispatcher, `/api/v1/dispatch/invoices/${first}`, "PATCH", { amount: 1 })).status, 403);
   assert.equal((await call(people.dispatcher, `/api/v1/dispatch/loads/${id(41)}`, "PATCH", { rate: 5 })).status, 422);
   assert.equal((await call(people.manager, `/api/v1/dispatch/invoices/${first}/actions`, "POST", { action: "FORWARD" })).status, 200);
   assert.equal((await call(people.manager, `/api/v1/dispatch/invoices/${first}/actions`, "POST", { action: "PAY" })).status, 200);
   assert.equal(invoice(first).status, "PAID");
+  assert.equal((await call(people.dispatcher, `/api/v1/dispatch/invoices/${first}/actions`, "POST", { action: "RECALL" })).status, 422);
   assert.equal((await call(people.manager, `/api/v1/dispatch/invoices/${first}`, "PATCH", { amount: 150, amount_paid: 150 })).status, 200);
   assert.equal(Number(invoice(first).amount_paid), 150);
   assert.equal((await call(people.manager, `/api/v1/dispatch/loads/${id(41)}`, "PATCH", { rate: 1100 })).status, 200);

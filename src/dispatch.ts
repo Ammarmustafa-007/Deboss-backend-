@@ -79,7 +79,7 @@ const invoiceEditSchema = z.object({
   add_load_ids: z.array(uuid).max(200).optional(), remove_load_ids: z.array(uuid).max(200).optional(),
   gross_amount: money.optional(), charge_percent: z.number().min(0).max(100).optional(), amount: money.optional(), amount_paid: money.optional(),
 }).strict();
-const invoiceActionSchema = z.object({ action: z.enum(["SUBMIT", "RETURN", "FORWARD", "PAY", "CANCEL", "SIGN_OFF", "RECALCULATE"]), note: z.string().trim().max(1000).optional(), amount_paid: money.optional() });
+const invoiceActionSchema = z.object({ action: z.enum(["SUBMIT", "RECALL", "RETURN", "FORWARD", "PAY", "CANCEL", "SIGN_OFF", "RECALCULATE"]), note: z.string().trim().max(1000).optional(), amount_paid: money.optional() });
 const targetSchema = z.object({ period_type: z.enum(["WEEKLY", "MONTHLY"]), amount: money });
 const commentSchema = z.object({ entity_type: z.enum(["CARRIER", "TRUCK", "DISPATCH_INVOICE"]), entity_id: uuid, body: z.string().trim().min(1).max(3000) });
 
@@ -558,10 +558,12 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       const people = await names(supabase, rows.map((row: any) => row.assigned_to));
       const teamsById = await teamNames(supabase, rows.map((row: any) => row.team_id));
       const hidden = moneyHidden(actor, scope); const activeSince = await firstPaid(supabase, rows.map((row: any) => row.id));
+      const { data: paidThisWeek } = rows.length ? await supabase.from("dispatch_invoices").select("truck_id, amount_paid").in("truck_id", rows.map((row: any) => row.id)).eq("status", "PAID").gte("paid_at", `${thisWeek}T00:00:00Z`) : { data: [] as any[] };
       response.json({ week_start: thisWeek, trucks: rows.map((truck: any) => {
         const mine = loads.filter((load: any) => load.truck_id === truck.id);
         const week = mine.filter((load: any) => weekStart(load.pickup_date) === thisWeek);
-        const row = { ...truck, carrier: one(truck.dispatch_carriers), dispatch_carriers: undefined, assigned_name: truck.assigned_to ? people.get(truck.assigned_to) ?? null : null, team_name: truck.team_id ? teamsById.get(truck.team_id) ?? null : null, week_gross: round(week.reduce((sum: number, load: any) => sum + Number(load.rate), 0)), week_loads: week.length, last_load_date: mine.map((load: any) => load.pickup_date).sort().pop() ?? null, sale_active_since: activeSince.get(truck.id) ?? null };
+        const paidWeek = (paidThisWeek ?? []).filter((invoice: any) => invoice.truck_id === truck.id);
+        const row = { ...truck, carrier: one(truck.dispatch_carriers), dispatch_carriers: undefined, assigned_name: truck.assigned_to ? people.get(truck.assigned_to) ?? null : null, team_name: truck.team_id ? teamsById.get(truck.team_id) ?? null : null, week_gross: round(paidWeek.reduce((sum: number, invoice: any) => sum + Number(invoice.amount_paid), 0)), week_loads: week.length, last_load_date: mine.map((load: any) => load.pickup_date).sort().pop() ?? null, sale_active_since: activeSince.get(truck.id) ?? null };
         return hidden ? { ...row, week_gross: null, week_loads: null, last_load_date: null } : row;
       }) });
     } catch (error) { next(error); }
@@ -859,6 +861,8 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       const flow: Record<string, { from: string[]; to: string; allowed: boolean; denied: string }> = {
         RECALCULATE: { from: ["DRAFT"], to: "DRAFT", allowed: dispatcher, denied: "Only the Dispatcher can update this invoice." },
         SUBMIT: { from: ["DRAFT"], to: "SUBMITTED", allowed: dispatcher, denied: "Only the Dispatcher can submit this invoice." },
+        // The Dispatcher takes a submitted invoice back to change it and send it again, until the manager forwards it.
+        RECALL: { from: ["SUBMITTED"], to: "DRAFT", allowed: dispatcher, denied: "Only the Dispatcher can recall this invoice." },
         RETURN: { from: ["SUBMITTED", "FORWARDED"], to: "DRAFT", allowed: reviewer, denied: "Only the Dispatch Manager can return this invoice." },
         FORWARD: { from: ["SUBMITTED"], to: "FORWARDED", allowed: reviewer, denied: "Only the Dispatch Manager can forward this invoice." },
         PAY: { from: ["FORWARDED"], to: "PAID", allowed: dispatcher || reviewer, denied: "Only the Dispatcher or Dispatch Manager can record payment." },
@@ -875,6 +879,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       // A cancelled invoice gives its loads back, so they can go on another invoice.
       if (input.action === "CANCEL") await supabase.from("dispatch_loads").update({ invoice_id: null }).eq("invoice_id", invoice.id);
       if (input.action === "SUBMIT") Object.assign(update, { submitted_at: now, review_note: null });
+      if (input.action === "RECALL") Object.assign(update, { submitted_at: null });
       if (input.action === "RETURN") Object.assign(update, { review_note: input.note, submitted_at: null, forwarded_at: null, forwarded_by: null });
       if (input.action === "FORWARD") Object.assign(update, { forwarded_at: now, forwarded_by: actor.id, review_note: input.note || null });
       if (input.action === "PAY") {
@@ -1008,6 +1013,9 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       const inRange = (day: string) => (!range.from || day >= range.from) && (!range.to || day <= range.to);
       const truckOf = new Map(trucks.map((truck: any) => [truck.id, truck]));
       const owed = (invoice: any) => invoice.status === "CANCELLED" ? 0 : Math.max(0, Number(invoice.amount) - Number(invoice.amount_paid));
+      // Client feedback: gross is what the company was paid (paid invoices, by the day paid), not what the carrier's loads were worth.
+      const paidRows = (invoiceData ?? []).filter((invoice: any) => invoice.status === "PAID" && invoice.paid_at).map((invoice: any) => ({ truck_id: invoice.truck_id, day: String(invoice.paid_at).slice(0, 10), amount: Number(invoice.amount_paid) }));
+      const paidGross = (ids: Set<string> | null, keep: (day: string) => boolean) => round(paidRows.filter((row: any) => (!ids || ids.has(row.truck_id)) && keep(row.day)).reduce((sum: number, row: any) => sum + row.amount, 0));
       const activeSince = await firstPaid(supabase, truckIds);
       const activeIn = (truck: any) => { const since = activeSince.get(truck.id)?.slice(0, 10); return Boolean(since && inRange(since)); };
 
@@ -1019,9 +1027,9 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
         const mine = trucks.filter((truck: any) => personOf(truck) === id);
         const mineIds = new Set(mine.map((truck: any) => truck.id));
         const myLoads = loads.filter((load: any) => mineIds.has(load.truck_id));
-        const weekGross = myLoads.filter((load: any) => load.pickup_date >= thisWeek).reduce((sum: number, load: any) => sum + Number(load.rate), 0);
-        const monthGross = myLoads.filter((load: any) => load.pickup_date >= thisMonth).reduce((sum: number, load: any) => sum + Number(load.rate), 0);
-        const periodGross = myLoads.filter((load: any) => inRange(load.pickup_date)).reduce((sum: number, load: any) => sum + Number(load.rate), 0);
+        const weekGross = paidGross(mineIds, (day) => day >= thisWeek);
+        const monthGross = paidGross(mineIds, (day) => day >= thisMonth);
+        const periodGross = paidGross(mineIds, inRange);
         const myInvoices = invoices.filter((invoice: any) => mineIds.has(invoice.truck_id));
         const myCarriers = sales ? scopedCarriers.filter((carrier: any) => carrier.owner_id === id) : [];
         const weeklyTarget = Number(targetRows?.find((row: any) => row.user_id === id && row.period_type === "WEEKLY")?.amount ?? 0);
@@ -1046,7 +1054,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
         return {
           id: carrier.id, company_name: carrier.company_name, mc_number: carrier.mc_number, dot_number: carrier.dot_number, owner: people.get(carrier.owner_id) ?? null, review_status: carrier.review_status, charge_percent: carrier.charge_percent,
           trucks: mine.length, running: mine.filter((truck: any) => truck.status === "RUNNING").length,
-          gross: round(loads.filter((load: any) => ids.has(load.truck_id) && inRange(load.pickup_date)).reduce((sum: number, load: any) => sum + Number(load.rate), 0)),
+          gross: paidGross(ids, inRange),
           revenue: round(carrierInvoices.reduce((sum: number, invoice: any) => sum + (invoice.status === "CANCELLED" ? 0 : Number(invoice.amount)), 0)),
           collected: round(carrierInvoices.reduce((sum: number, invoice: any) => sum + Number(invoice.amount_paid), 0)),
           outstanding: round(carrierInvoices.reduce((sum: number, invoice: any) => sum + owed(invoice), 0)),
@@ -1060,8 +1068,8 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
         return {
           id: truck.id, unit_number: truck.unit_number, truck_type: truck.truck_type, status: truck.status, carrier: truck.carrier.company_name, dispatcher: truck.assigned_to ? truckPeople.get(truck.assigned_to) ?? null : null, sale_active_since: activeSince.get(truck.id) ?? null,
           loads: truckLoads.filter((load: any) => inRange(load.pickup_date)).length,
-          week_gross: round(truckLoads.filter((load: any) => load.pickup_date >= thisWeek).reduce((sum: number, load: any) => sum + Number(load.rate), 0)),
-          gross: round(truckLoads.filter((load: any) => inRange(load.pickup_date)).reduce((sum: number, load: any) => sum + Number(load.rate), 0)),
+          week_gross: paidGross(new Set([truck.id]), (day) => day >= thisWeek),
+          gross: paidGross(new Set([truck.id]), inRange),
           revenue: round(truckInvoices.reduce((sum: number, invoice: any) => sum + (invoice.status === "CANCELLED" ? 0 : Number(invoice.amount)), 0)),
           outstanding: round(truckInvoices.reduce((sum: number, invoice: any) => sum + owed(invoice), 0)),
         };
@@ -1080,9 +1088,9 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
           onboarded: trucks.filter((truck: any) => ["ACTIVE", "ONBOARDED", "RUNNING", "INACTIVE"].includes(truck.status)).length,
           pending: scopedCarriers.filter((carrier: any) => ["DOCS_PENDING", "PENDING_REVIEW", "RETURNED"].includes(carrier.review_status)).length,
           loads: periodLoads.length,
-          gross: round(periodLoads.reduce((sum: number, load: any) => sum + Number(load.rate), 0)),
-          week_gross: round(loads.filter((load: any) => load.pickup_date >= thisWeek).reduce((sum: number, load: any) => sum + Number(load.rate), 0)),
-          month_gross: round(loads.filter((load: any) => load.pickup_date >= thisMonth).reduce((sum: number, load: any) => sum + Number(load.rate), 0)),
+          gross: paidGross(null, inRange),
+          week_gross: paidGross(null, (day) => day >= thisWeek),
+          month_gross: paidGross(null, (day) => day >= thisMonth),
           revenue: round(invoices.reduce((sum: number, invoice: any) => sum + (invoice.status === "CANCELLED" ? 0 : Number(invoice.amount)), 0)),
           collected: round(invoices.reduce((sum: number, invoice: any) => sum + Number(invoice.amount_paid), 0)),
           outstanding: round(invoices.reduce((sum: number, invoice: any) => sum + owed(invoice), 0)),
