@@ -4,8 +4,8 @@ import { z } from "zod";
 
 /**
  * Fronters (Brokerage lead mining). Fronters work raw prospects in a spreadsheet: add, paste, import, edit and set
- * a status. When a prospect is marked Qualified it becomes a normal Brokerage Sales lead for the agent chosen in
- * "Assign to", and it locks for the Fronter. Only Sales converts leads to customers. Reports credit each Fronter
+ * a status. When a prospect is marked Qualified it becomes a normal Brokerage Sales lead for the Sales agent the
+ * Fronter works for (set on their user), and it locks for the Fronter. Only Sales converts leads to customers. Reports credit each Fronter
  * with what they mined, qualified and what became a customer.
  */
 
@@ -55,6 +55,24 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
     return response.status(403).json({ error: "This area is for the Fronters department." });
   }
   const guard = [requireUser, fronterOnly] as Handler[];
+  // Brokerage Sales also open the mining sheet of the Fronters who work for them (agents: their own; managers: their department's).
+  const isSales = (actor: Actor) => actor.department?.business_unit === "BROKERAGE" && actor.department?.function === "SALES";
+  function fronterOrSales(request: Req, response: Response, next: NextFunction) {
+    const actor = request.actor!;
+    if (isSuper(actor) || isFronter(actor) || isSales(actor)) return next();
+    return response.status(403).json({ error: "This area is for the Fronters and Brokerage Sales." });
+  }
+  const sheetGuard = [requireUser, fronterOrSales] as Handler[];
+  async function linkedFronters(supabase: SupabaseClient, actor: Actor) {
+    let agentIds = [actor.id];
+    if (isManager(actor)) {
+      const { data } = await supabase.from("profiles").select("id").eq("department_id", actor.department_id!).eq("role", "AGENT");
+      agentIds = (data ?? []).map((row: any) => row.id);
+    }
+    if (!agentIds.length) return [] as string[];
+    const { data } = await supabase.from("profiles").select("id").in("sales_agent_id", agentIds);
+    return (data ?? []).map((row: any) => row.id as string);
+  }
   const canView = (actor: Actor, scope: Scope, row: any) => isSuper(actor) || (isManager(actor) && row.department_id === actor.department_id) || row.created_by === actor.id || lead(scope, "fronter.prospects.view_team", row);
   const canEdit = (actor: Actor, scope: Scope, row: any) => row.status !== "QUALIFIED" && (isSuper(actor) || (isManager(actor) && row.department_id === actor.department_id) || row.created_by === actor.id || lead(scope, "fronter.prospects.edit_team", row));
 
@@ -76,18 +94,22 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
     try { response.json({ agents: await salesAgents(adminClient()) }); } catch (error) { next(error); }
   });
 
-  app.get("/api/v1/fronter/prospects", ...guard, async (request: Req, response, next) => {
+  app.get("/api/v1/fronter/prospects", ...sheetGuard, async (request: Req, response, next) => {
     try {
       const actor = request.actor!; const supabase = adminClient(); const scope = await teamScope(actor);
+      const sales = isSales(actor);
+      const fronters = sales ? await linkedFronters(supabase, actor) : [];
+      if (sales && !fronters.length) return response.json({ prospects: [] });
       let query = supabase.from("fronter_prospects").select("*").order("created_at", { ascending: false }).limit(5000);
-      if (!isSuper(actor)) query = query.eq("department_id", actor.department_id!);
+      if (sales) query = query.in("created_by", fronters);
+      else if (!isSuper(actor)) query = query.eq("department_id", actor.department_id!);
       const { data, error } = await query; if (error) throw error;
-      const rows = (data ?? []).filter((row: any) => canView(actor, scope, row));
+      const rows = sales ? data ?? [] : (data ?? []).filter((row: any) => canView(actor, scope, row));
       const people = await names(supabase, rows.flatMap((row: any) => [row.created_by, row.assigned_to]));
       const leadIds = rows.map((row: any) => row.lead_id).filter(Boolean);
       const { data: leads } = leadIds.length ? await supabase.from("sales_leads").select("id, stage").in("id", leadIds) : { data: [] as any[] };
       const stageOf = new Map((leads ?? []).map((row: any) => [row.id, row.stage]));
-      response.json({ prospects: rows.map((row: any) => ({ ...row, created_by_name: people.get(row.created_by) ?? null, assigned_name: row.assigned_to ? people.get(row.assigned_to) ?? null : null, lead_stage: row.lead_id ? stageOf.get(row.lead_id) ?? null : null, editable: canEdit(actor, scope, row) })) });
+      response.json({ prospects: rows.map((row: any) => ({ ...row, created_by_name: people.get(row.created_by) ?? null, assigned_name: row.assigned_to ? people.get(row.assigned_to) ?? null : null, lead_stage: row.lead_id ? stageOf.get(row.lead_id) ?? null : null, editable: sales ? row.status !== "QUALIFIED" : canEdit(actor, scope, row), fields_locked: sales })) });
     } catch (error) { next(error); }
   });
 
@@ -111,21 +133,31 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
   });
 
   /** A cell edit, a status change or the assignee. Qualified turns the row into a Sales lead and locks it. */
-  app.patch("/api/v1/fronter/prospects/:id", ...guard, async (request: Req, response, next) => {
+  app.patch("/api/v1/fronter/prospects/:id", ...sheetGuard, async (request: Req, response, next) => {
     try {
       const actor = request.actor!; const input = prospectUpdateSchema.parse(request.body); const supabase = adminClient(); const scope = await teamScope(actor);
       const { data: row } = await supabase.from("fronter_prospects").select("*").eq("id", uuid.parse(request.params.id)).maybeSingle();
       if (!row) return response.status(404).json({ error: "Prospect not found." });
       if (row.status === "QUALIFIED") return response.status(422).json({ error: "This prospect is qualified and now belongs to Brokerage Sales." });
-      if (!canEdit(actor, scope, row)) return response.status(403).json({ error: "You can't edit this prospect." });
+      const sales = isSales(actor);
+      if (sales) {
+        if (!(await linkedFronters(supabase, actor)).includes(row.created_by)) return response.status(403).json({ error: "This prospect belongs to a Fronter who doesn't work for you." });
+        if (Object.keys(input).some((key) => key !== "status")) return response.status(403).json({ error: "Sales can change the status only. The Fronter fills in the details." });
+      } else if (!canEdit(actor, scope, row)) return response.status(403).json({ error: "You can't edit this prospect." });
       const { status, assigned_to, ...fields } = input;
       if (assigned_to) { const agents = await salesAgents(supabase); if (!agents.some((agent) => agent.id === assigned_to)) return response.status(422).json({ error: "Assign to an active Brokerage Sales agent." }); }
       const next_ = { ...row, ...fields, ...(assigned_to !== undefined ? { assigned_to } : {}) };
 
       if (status === "QUALIFIED") {
-        const qualifier = isSuper(actor) || isManager(actor) || row.created_by === actor.id || lead(scope, "fronter.prospects.qualify", row);
+        const qualifier = sales || isSuper(actor) || isManager(actor) || row.created_by === actor.id || lead(scope, "fronter.prospects.qualify", row);
         if (!qualifier) return response.status(403).json({ error: "You can't qualify this prospect." });
-        if (!next_.assigned_to) return response.status(422).json({ error: "Choose a Sales agent in “Assign to” before qualifying." });
+        // The lead goes to the Sales agent the Fronter who mined it works for (set when the Fronter's login is created).
+        if (!next_.assigned_to) {
+          const { data: miner } = await supabase.from("profiles").select("sales_agent_id").eq("id", row.created_by).maybeSingle();
+          const agents = await salesAgents(supabase);
+          if (!miner?.sales_agent_id || !agents.some((agent) => agent.id === miner.sales_agent_id)) return response.status(422).json({ error: "This Fronter has no active Sales agent linked. Ask the Super Admin to set one on their user." });
+          next_.assigned_to = miner.sales_agent_id;
+        }
         const { data: owner } = await supabase.from("profiles").select("id, department_id").eq("id", next_.assigned_to).single();
         // The lead takes over everything the Fronter collected, so Sales sees and edits it on the lead itself.
         const { data: membership } = await supabase.from("team_members").select("team_id").eq("user_id", next_.assigned_to).limit(1).maybeSingle();

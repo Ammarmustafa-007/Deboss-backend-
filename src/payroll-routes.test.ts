@@ -4,47 +4,7 @@ import type { Server } from "node:http";
 import { after, before, test } from "node:test";
 import express from "express";
 import { registerPayrollRoutes } from "./payroll.js";
-
-/** In-memory stand-in for Supabase with writes, so the real routes run without a database. */
-function fakeSupabase(tables: Record<string, any[]>) {
-  const keys: Record<string, string[]> = { employee_records: ["user_id"], attendance_records: ["user_id", "work_date"], payroll_months: ["period"] };
-  const from = (table: string) => {
-    const filters: ((row: any) => boolean)[] = [];
-    let action: { kind: string; value?: any } = { kind: "select" };
-    const rows = () => (tables[table] ??= []);
-    const run = () => {
-      const matching = rows().filter((row) => filters.every((check) => check(row)));
-      if (action.kind === "update") matching.forEach((row) => Object.assign(row, action.value));
-      if (action.kind === "delete") tables[table] = rows().filter((row) => !matching.includes(row));
-      if (action.kind === "insert") { const added = [action.value].flat().map((row, index) => ({ id: `${table}-${rows().length + index}`, ...row })); rows().push(...added); return added; }
-      if (action.kind === "upsert") {
-        const key = keys[table]; const found = rows().find((row) => key.every((name) => row[name] === action.value[name]));
-        if (found) Object.assign(found, action.value); else rows().push({ ...action.value });
-        return [action.value];
-      }
-      return matching;
-    };
-    const builder: any = {
-      select: () => builder, order: () => builder, limit: () => builder,
-      insert: (value: any) => { action = { kind: "insert", value }; return builder; },
-      update: (value: any) => { action = { kind: "update", value }; return builder; },
-      upsert: (value: any) => { action = { kind: "upsert", value }; return builder; },
-      delete: () => { action = { kind: "delete" }; return builder; },
-      eq: (key: string, value: unknown) => { filters.push((row) => row[key] === value); return builder; },
-      neq: (key: string, value: unknown) => { filters.push((row) => row[key] !== value); return builder; },
-      in: (key: string, values: unknown[]) => { filters.push((row) => values.includes(row[key])); return builder; },
-      gte: (key: string, value: string) => { filters.push((row) => row[key] != null && row[key] >= value); return builder; },
-      lt: (key: string, value: string) => { filters.push((row) => row[key] != null && row[key] < value); return builder; },
-      lte: (key: string, value: string) => { filters.push((row) => row[key] != null && row[key] <= value); return builder; },
-      not: (key: string, op: string, value: string) => { filters.push((row) => op === "in" ? !value.slice(1, -1).split(",").includes(row[key]) : row[key] != null); return builder; },
-      maybeSingle: async () => ({ data: run()[0] ?? null, error: null }),
-      single: async () => ({ data: run()[0] ?? null, error: null }),
-      then: (resolve: (value: unknown) => void) => resolve({ data: run(), error: null }),
-    };
-    return builder;
-  };
-  return { from } as never;
-}
+import { fakeSupabase } from "./fake-supabase.js";
 
 const ids = Object.fromEntries(["boss", "m1", "m2", "a1", "a2", "a3", "opsm", "opsa", "gone", "stays"].map((name, index) => [name, `00000000-0000-4000-8000-00000000000${index}`]));
 const rules = {

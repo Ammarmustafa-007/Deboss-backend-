@@ -74,6 +74,11 @@ const loadSchema = z.object({
   rate: money, miles: z.number().int().nonnegative().max(20_000).nullable().optional(),
   status: z.enum(["BOOKED", "DELIVERED", "CANCELLED"]).optional(), notes: optionalText(1000),
 });
+const invoiceCreateSchema = z.object({ load_ids: z.array(uuid).min(1, "Choose at least one load").max(200) }).strict();
+const invoiceEditSchema = z.object({
+  add_load_ids: z.array(uuid).max(200).optional(), remove_load_ids: z.array(uuid).max(200).optional(),
+  gross_amount: money.optional(), charge_percent: z.number().min(0).max(100).optional(), amount: money.optional(), amount_paid: money.optional(),
+}).strict();
 const invoiceActionSchema = z.object({ action: z.enum(["SUBMIT", "RETURN", "FORWARD", "PAY", "CANCEL", "SIGN_OFF", "RECALCULATE"]), note: z.string().trim().max(1000).optional(), amount_paid: money.optional() });
 const targetSchema = z.object({ period_type: z.enum(["WEEKLY", "MONTHLY"]), amount: money });
 const commentSchema = z.object({ entity_type: z.enum(["CARRIER", "TRUCK", "DISPATCH_INVOICE"]), entity_id: uuid, body: z.string().trim().min(1).max(3000) });
@@ -147,6 +152,10 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
   /** A carrier is visible from the Sales side, or from Operations through any of its trucks. */
   const carrierVisible = (actor: Actor, scope: Scope, carrier: any, trucks: any[]) => carrierSalesView(actor, scope, carrier) || trucks.some((truck) => truckOpsView(actor, scope, truck));
   const truckVisible = (actor: Actor, scope: Scope, truck: any, carrier: any) => truckOpsView(actor, scope, truck) || carrierSalesView(actor, scope, carrier);
+  /** Client feedback: a Dispatch Sales Agent sees which of their trucks became active sales, never invoices or gross. */
+  const moneyHidden = (actor: Actor, scope: Scope) => isDispatchSales(actor) && !isManager(actor) && !isSuper(actor) && !scope.permissions.has("dispatch_sales.invoices.signoff");
+  /** Who may change an invoice: the Dispatcher while it is a Draft, the Dispatch Manager at any stage. */
+  const invoiceEdit = (actor: Actor, scope: Scope, invoice: any, truck: any) => invoiceReview(actor, scope, invoice, truck) || (invoice.status === "DRAFT" && truckOpsUpdate(actor, scope, truck));
 
   async function notify(supabase: SupabaseClient, recipients: (string | null | undefined)[], actorId: string, kind: string, title: string, body: string, entityType: string, entityId: string) {
     const rows = [...new Set(recipients.filter((id): id is string => Boolean(id) && id !== actorId))].map((recipient_id) => ({ recipient_id, kind, title, body: body.slice(0, 140), entity_type: entityType, entity_id: entityId }));
@@ -195,6 +204,32 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
     const { data, error } = await query;
     if (error) throw error;
     return data ?? [];
+  }
+
+  /** An active sale is a truck that has paid its first invoice: when that happened, per truck. */
+  async function firstPaid(supabase: SupabaseClient, truckIds: string[]) {
+    if (!truckIds.length) return new Map<string, string>();
+    const { data, error } = await supabase.from("dispatch_invoices").select("truck_id, paid_at").in("truck_id", truckIds).eq("status", "PAID").not("paid_at", "is", null);
+    if (error) throw error;
+    const first = new Map<string, string>();
+    for (const row of data ?? []) if (!first.has(row.truck_id) || row.paid_at < first.get(row.truck_id)!) first.set(row.truck_id, row.paid_at);
+    return first;
+  }
+  /** An invoice's gross is its loads' rates; the amount is gross x charge %. Week dates follow the loads it holds. */
+  async function recomputeInvoice(supabase: SupabaseClient, invoiceId: string, chargePercent?: number) {
+    const [{ data: invoice }, { data: loads }] = await Promise.all([
+      supabase.from("dispatch_invoices").select("id, charge_percent").eq("id", invoiceId).maybeSingle(),
+      supabase.from("dispatch_loads").select("rate, pickup_date, status").eq("invoice_id", invoiceId),
+    ]);
+    if (!invoice) return null;
+    const live = (loads ?? []).filter((load: any) => load.status !== "CANCELLED");
+    const gross = round(live.reduce((sum: number, load: any) => sum + Number(load.rate), 0));
+    const percent = chargePercent ?? Number(invoice.charge_percent);
+    const dates = (loads ?? []).map((load: any) => load.pickup_date as string).sort();
+    const update = { gross_amount: gross, charge_percent: percent, amount: round(gross * percent / 100), ...(dates.length ? { week_start: weekStart(dates[0]), week_end: dates[dates.length - 1] } : {}) };
+    const { data, error } = await supabase.from("dispatch_invoices").update(update).eq("id", invoiceId).select().single();
+    if (error) throw error;
+    return data;
   }
 
   // ---- Workspace-level data ----------------------------------------------------------------------------------
@@ -269,6 +304,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       const { carrier, trucks } = found;
       if (!carrierVisible(actor, scope, carrier, trucks)) return response.status(403).json({ error: "This carrier is outside your work scope." });
       const salesSide = carrierSalesView(actor, scope, carrier);
+      const hidden = moneyHidden(actor, scope);
       // Operations people only see the trucks they handle.
       const visibleTrucks = salesSide ? trucks : trucks.filter((truck: any) => truckOpsView(actor, scope, truck));
       const [{ data: documents }, { data: activities }, { data: comments }, { data: invoices }] = await Promise.all([
@@ -281,13 +317,14 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       const teamsById = await teamNames(supabase, [carrier.team_id, ...visibleTrucks.map((truck: any) => truck.team_id)]);
       const { data: department } = carrier.dispatch_department_id ? await supabase.from("departments").select("name").eq("id", carrier.dispatch_department_id).maybeSingle() : { data: null };
       const missing = requiredDocuments.filter((type) => !(documents ?? []).some((row: any) => row.document_type === type));
+      const activeSince = await firstPaid(supabase, visibleTrucks.map((truck: any) => truck.id));
       response.json({
         carrier: { ...carrier, owner_name: people.get(carrier.owner_id) ?? null, reviewed_by_name: carrier.reviewed_by ? people.get(carrier.reviewed_by) ?? null : null, team_name: carrier.team_id ? teamsById.get(carrier.team_id) ?? null : null, dispatch_department_name: department?.name ?? null },
-        trucks: visibleTrucks.map((truck: any) => ({ ...truck, assigned_name: truck.assigned_to ? people.get(truck.assigned_to) ?? null : null, team_name: truck.team_id ? teamsById.get(truck.team_id) ?? null : null })),
+        trucks: visibleTrucks.map((truck: any) => ({ ...truck, assigned_name: truck.assigned_to ? people.get(truck.assigned_to) ?? null : null, team_name: truck.team_id ? teamsById.get(truck.team_id) ?? null : null, sale_active_since: activeSince.get(truck.id) ?? null })),
         documents: (documents ?? []).map((row: any) => ({ ...row, uploaded_by_name: people.get(row.uploaded_by) ?? null })),
         activities: (activities ?? []).map((row: any) => ({ ...row, author_id: row.created_by, author_name: people.get(row.created_by) ?? null })),
         comments: await withAuthorDetails(supabase, comments ?? [], actor.id, isManager(actor) || isSuper(actor)),
-        invoices: (invoices ?? []).filter((row: any) => visibleTrucks.some((truck: any) => truck.id === row.truck_id)),
+        invoices: hidden ? [] : (invoices ?? []).filter((row: any) => visibleTrucks.some((truck: any) => truck.id === row.truck_id)),
         missing_documents: missing,
         duplicates: await duplicates(supabase, carrier.mc_number, carrier.dot_number, carrier.id),
         rights: {
@@ -296,7 +333,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
           review: carrierReview(actor, scope, carrier) && carrier.review_status === "PENDING_REVIEW",
           assign: carrierAssign(actor, scope, carrier),
           terms: carrierSalesEdit(actor, scope, carrier) || visibleTrucks.some((truck: any) => truckOpsUpdate(actor, scope, truck)),
-          sales_side: salesSide,
+          sales_side: salesSide, money_hidden: hidden,
         },
       });
     } catch (error) { next(error); }
@@ -520,10 +557,12 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       const loads = await grossByTruckWeek(supabase, rows.map((row: any) => row.id), addDays(thisWeek, -28));
       const people = await names(supabase, rows.map((row: any) => row.assigned_to));
       const teamsById = await teamNames(supabase, rows.map((row: any) => row.team_id));
+      const hidden = moneyHidden(actor, scope); const activeSince = await firstPaid(supabase, rows.map((row: any) => row.id));
       response.json({ week_start: thisWeek, trucks: rows.map((truck: any) => {
         const mine = loads.filter((load: any) => load.truck_id === truck.id);
         const week = mine.filter((load: any) => weekStart(load.pickup_date) === thisWeek);
-        return { ...truck, carrier: one(truck.dispatch_carriers), dispatch_carriers: undefined, assigned_name: truck.assigned_to ? people.get(truck.assigned_to) ?? null : null, team_name: truck.team_id ? teamsById.get(truck.team_id) ?? null : null, week_gross: round(week.reduce((sum: number, load: any) => sum + Number(load.rate), 0)), week_loads: week.length, last_load_date: mine.map((load: any) => load.pickup_date).sort().pop() ?? null };
+        const row = { ...truck, carrier: one(truck.dispatch_carriers), dispatch_carriers: undefined, assigned_name: truck.assigned_to ? people.get(truck.assigned_to) ?? null : null, team_name: truck.team_id ? teamsById.get(truck.team_id) ?? null : null, week_gross: round(week.reduce((sum: number, load: any) => sum + Number(load.rate), 0)), week_loads: week.length, last_load_date: mine.map((load: any) => load.pickup_date).sort().pop() ?? null, sale_active_since: activeSince.get(truck.id) ?? null };
+        return hidden ? { ...row, week_gross: null, week_loads: null, last_load_date: null } : row;
       }) });
     } catch (error) { next(error); }
   });
@@ -542,14 +581,16 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       ]);
       const people = await names(supabase, [truck.assigned_to, carrier.owner_id, ...(loads ?? []).map((row: any) => row.dispatcher_id)]);
       const { data: target } = truck.assigned_to ? await supabase.from("dispatch_targets").select("period_type, amount").eq("user_id", truck.assigned_to) : { data: [] as any[] };
+      const hidden = moneyHidden(actor, scope) && !truckOpsView(actor, scope, truck);
+      const activeSince = (await firstPaid(supabase, [truck.id])).get(truck.id) ?? null;
       response.json({
-        truck: { ...truck, dispatch_carriers: undefined, assigned_name: truck.assigned_to ? people.get(truck.assigned_to) ?? null : null },
+        truck: { ...truck, dispatch_carriers: undefined, assigned_name: truck.assigned_to ? people.get(truck.assigned_to) ?? null : null, sale_active_since: activeSince },
         carrier: { ...carrier, owner_name: people.get(carrier.owner_id) ?? null },
-        loads: (loads ?? []).map((row: any) => ({ ...row, dispatcher_name: people.get(row.dispatcher_id) ?? null, week_start: weekStart(row.pickup_date) })),
-        invoices: invoices ?? [],
+        loads: hidden ? [] : (loads ?? []).map((row: any) => ({ ...row, dispatcher_name: people.get(row.dispatcher_id) ?? null, week_start: weekStart(row.pickup_date) })),
+        invoices: hidden ? [] : invoices ?? [],
         comments: await withAuthorDetails(supabase, comments ?? [], actor.id, isManager(actor) || isSuper(actor)),
-        targets: target ?? [],
-        rights: { update: truckOpsUpdate(actor, scope, truck), assign: truckAssign(actor, scope, truck), terms: truckOpsUpdate(actor, scope, truck) || carrierSalesEdit(actor, scope, carrier), sales_side: carrierSalesView(actor, scope, carrier) && !truckOpsView(actor, scope, truck) },
+        targets: hidden ? [] : target ?? [],
+        rights: { update: truckOpsUpdate(actor, scope, truck), assign: truckAssign(actor, scope, truck), terms: truckOpsUpdate(actor, scope, truck) || carrierSalesEdit(actor, scope, carrier), sales_side: carrierSalesView(actor, scope, carrier) && !truckOpsView(actor, scope, truck), money_hidden: hidden },
       });
     } catch (error) { next(error); }
   });
@@ -626,25 +667,20 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       if (query.to) loadQuery = loadQuery.lte("pickup_date", query.to);
       if (query.status) loadQuery = loadQuery.eq("status", query.status);
       const { data, error } = await loadQuery; if (error) throw error;
-      const rows = (data ?? []).filter((load: any) => { const truck = one(load.dispatch_trucks); return truck && truckVisible(actor, scope, truck, one(truck.dispatch_carriers)); });
+      const hidden = moneyHidden(actor, scope);
+      const rows = (data ?? []).filter((load: any) => { const truck = one(load.dispatch_trucks); return truck && (hidden ? truckOpsView(actor, scope, truck) : truckVisible(actor, scope, truck, one(truck.dispatch_carriers))); });
       const people = await names(supabase, rows.map((row: any) => row.dispatcher_id));
       response.json({ loads: rows.map((load: any) => { const truck = one(load.dispatch_trucks); return { ...load, dispatch_trucks: undefined, truck: { id: truck.id, unit_number: truck.unit_number, truck_type: truck.truck_type }, carrier: { id: one(truck.dispatch_carriers)?.id, company_name: one(truck.dispatch_carriers)?.company_name }, dispatcher_name: people.get(load.dispatcher_id) ?? null, week_start: weekStart(load.pickup_date) }; }) });
     } catch (error) { next(error); }
   });
 
-  /** A load's week is locked once that week's invoice has left Draft, so invoices never drift from their loads. */
-  async function weekLocked(supabase: SupabaseClient, truckId: string, pickupDate: string) {
-    const { data } = await supabase.from("dispatch_invoices").select("id, status").eq("truck_id", truckId).eq("week_start", weekStart(pickupDate)).maybeSingle();
-    return data && !["DRAFT", "CANCELLED"].includes(data.status) ? data : null;
+  /** A load on a submitted invoice is locked for the Dispatcher; the Dispatch Manager can still change it. */
+  async function loadLocked(supabase: SupabaseClient, actor: Actor, scope: Scope, load: any, truck: any) {
+    if (!load.invoice_id) return false;
+    const { data: invoice } = await supabase.from("dispatch_invoices").select("id, status, dispatch_department_id, dispatcher_id").eq("id", load.invoice_id).maybeSingle();
+    return Boolean(invoice && !invoiceEdit(actor, scope, invoice, truck));
   }
-  async function refreshDraftInvoice(supabase: SupabaseClient, truckId: string, pickupDate: string) {
-    const week = weekStart(pickupDate);
-    const { data: invoice } = await supabase.from("dispatch_invoices").select("id, status, charge_percent").eq("truck_id", truckId).eq("week_start", week).maybeSingle();
-    if (!invoice || invoice.status !== "DRAFT") return;
-    const loads = await grossByTruckWeek(supabase, [truckId], week, addDays(week, 6));
-    const gross = round(loads.reduce((sum: number, load: any) => sum + Number(load.rate), 0));
-    await supabase.from("dispatch_invoices").update({ gross_amount: gross, amount: round(gross * Number(invoice.charge_percent) / 100) }).eq("id", invoice.id);
-  }
+  const lockedMessage = "This load is on an invoice that has been submitted. Ask the Dispatch Manager to change it.";
 
   app.post("/api/v1/dispatch/trucks/:id/loads", ...guard, async (request: Req, response, next) => {
     try {
@@ -654,14 +690,12 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       if (!truckOpsUpdate(actor, scope, truck)) return response.status(403).json({ error: "Only the truck's Dispatcher or the Dispatch Manager can log loads." });
       if (!["ONBOARDED", "RUNNING", "INACTIVE"].includes(truck.status) || !truck.assigned_to) return response.status(422).json({ error: "Loads can be logged once the truck is assigned to a Dispatcher." });
       if (input.delivery_date && input.delivery_date < input.pickup_date) return response.status(422).json({ error: "Delivery date can't be before pickup." });
-      if (await weekLocked(supabase, truck.id, input.pickup_date)) return response.status(422).json({ error: "That week's invoice has already been submitted. Ask the Dispatch Manager to return it first." });
       const { data, error } = await supabase.from("dispatch_loads").insert({ ...input, truck_id: truck.id, dispatcher_id: truck.assigned_to }).select().single(); if (error) throw error;
       // Weekly loads being booked puts the truck in Running (Figure 5).
       if (["ONBOARDED", "INACTIVE"].includes(truck.status) && data.status !== "CANCELLED") {
         await supabase.from("dispatch_trucks").update({ status: "RUNNING" }).eq("id", truck.id);
         await writeAudit(supabase, actor.id, "TRUCK_STATUS_CHANGED", "dispatch_truck", truck.id, { from_status: truck.status, to_status: "RUNNING", reason: "Load booked" });
       }
-      await refreshDraftInvoice(supabase, truck.id, input.pickup_date);
       await writeAudit(supabase, actor.id, "LOAD_ADDED", "dispatch_load", data.id, { truck_id: truck.id, rate: input.rate });
       response.status(201).json({ load: data });
     } catch (error) { next(error); }
@@ -674,12 +708,11 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       if (!load) return response.status(404).json({ error: "Load not found." });
       const truck = one((load as any).dispatch_trucks);
       if (!truckOpsUpdate(actor, scope, truck)) return response.status(403).json({ error: "You cannot edit this load." });
-      if (await weekLocked(supabase, truck.id, load.pickup_date) || (input.pickup_date && await weekLocked(supabase, truck.id, input.pickup_date))) return response.status(422).json({ error: "That week's invoice has already been submitted. Ask the Dispatch Manager to return it first." });
+      if (await loadLocked(supabase, actor, scope, load, truck)) return response.status(422).json({ error: lockedMessage });
       const nextPickup = input.pickup_date ?? load.pickup_date; const nextDelivery = input.delivery_date === undefined ? load.delivery_date : input.delivery_date;
       if (nextDelivery && nextDelivery < nextPickup) return response.status(422).json({ error: "Delivery date can't be before pickup." });
       const { data, error } = await supabase.from("dispatch_loads").update(input).eq("id", load.id).select().single(); if (error) throw error;
-      await refreshDraftInvoice(supabase, truck.id, load.pickup_date);
-      if (input.pickup_date && weekStart(input.pickup_date) !== weekStart(load.pickup_date)) await refreshDraftInvoice(supabase, truck.id, input.pickup_date);
+      if (load.invoice_id) await recomputeInvoice(supabase, load.invoice_id);
       await writeAudit(supabase, actor.id, "LOAD_UPDATED", "dispatch_load", load.id, { fields: Object.keys(input) });
       response.json({ load: data });
     } catch (error) { next(error); }
@@ -692,9 +725,9 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       if (!load) return response.status(404).json({ error: "Load not found." });
       const truck = one((load as any).dispatch_trucks);
       if (!truckOpsUpdate(actor, scope, truck)) return response.status(403).json({ error: "You cannot delete this load." });
-      if (await weekLocked(supabase, truck.id, load.pickup_date)) return response.status(422).json({ error: "That week's invoice has already been submitted." });
+      if (await loadLocked(supabase, actor, scope, load, truck)) return response.status(422).json({ error: lockedMessage });
       const { error } = await supabase.from("dispatch_loads").delete().eq("id", load.id); if (error) throw error;
-      await refreshDraftInvoice(supabase, truck.id, load.pickup_date);
+      if (load.invoice_id) await recomputeInvoice(supabase, load.invoice_id);
       await writeAudit(supabase, actor.id, "LOAD_DELETED", "dispatch_load", load.id, { truck_id: truck.id });
       response.json({ ok: true });
     } catch (error) { next(error); }
@@ -717,39 +750,100 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
     try {
       const actor = request.actor!; const supabase = adminClient(); const scope = await teamScope(actor);
       const rows = await invoiceRows(supabase, (query) => isSuper(actor) ? query : isDispatchSales(actor) ? query.eq("sales_department_id", actor.department_id) : query.eq("dispatch_department_id", actor.department_id));
+      const hidden = moneyHidden(actor, scope);
       const visible = rows.filter((invoice: any) => {
         const truck = one(invoice.dispatch_trucks); const carrier = one(invoice.dispatch_carriers);
-        return truckOpsView(actor, scope, truck) || carrierSalesView(actor, scope, carrier) || invoiceReview(actor, scope, invoice, truck) || invoiceSignOff(actor, scope, invoice, carrier);
+        return truckOpsView(actor, scope, truck) || (!hidden && carrierSalesView(actor, scope, carrier)) || invoiceReview(actor, scope, invoice, truck) || invoiceSignOff(actor, scope, invoice, carrier);
       });
       const people = await names(supabase, visible.flatMap((row: any) => [row.dispatcher_id, row.sales_agent_id]));
       response.json({ invoices: visible.map((row: any) => decorate(row, people)) });
     } catch (error) { next(error); }
   });
 
-  /** The Dispatcher creates a truck's weekly invoice from that week's loads (gross x charge %). */
+  /** The Dispatcher builds an invoice from the loads they choose, from any week (gross x charge %). A truck can have several. */
   app.post("/api/v1/dispatch/trucks/:id/invoices", ...guard, async (request: Req, response, next) => {
     try {
-      const actor = request.actor!; const input = z.object({ week_start: z.string().date() }).parse(request.body); const supabase = adminClient(); const scope = await teamScope(actor);
+      const actor = request.actor!; const input = invoiceCreateSchema.parse(request.body); const supabase = adminClient(); const scope = await teamScope(actor);
       const { data: truck } = await supabase.from("dispatch_trucks").select("*, dispatch_carriers(*)").eq("id", uuid.parse(request.params.id)).maybeSingle();
       if (!truck) return response.status(404).json({ error: "Truck not found." });
       const carrier = one((truck as any).dispatch_carriers);
       if (!truckOpsUpdate(actor, scope, truck) || !truck.assigned_to) return response.status(403).json({ error: "Only the truck's Dispatcher can create its invoice." });
       if (carrier.charge_percent == null) return response.status(422).json({ error: "Set the carrier's charge % first." });
-      const week = weekStart(input.week_start);
-      if (week > weekStart(new Date())) return response.status(422).json({ error: "You can't invoice a future week." });
-      const { data: existing } = await supabase.from("dispatch_invoices").select("id, status").eq("truck_id", truck.id).eq("week_start", week).maybeSingle();
-      if (existing && existing.status !== "CANCELLED") return response.status(422).json({ error: "This week already has an invoice for this truck." });
-      const loads = await grossByTruckWeek(supabase, [truck.id], week, addDays(week, 6));
-      if (!loads.length) return response.status(422).json({ error: "There are no loads in that week to invoice." });
-      const gross = round(loads.reduce((sum: number, load: any) => sum + Number(load.rate), 0));
-      const fields = { truck_id: truck.id, carrier_id: carrier.id, dispatcher_id: truck.assigned_to, dispatch_department_id: truck.dispatch_department_id, sales_department_id: carrier.department_id, sales_agent_id: carrier.owner_id, week_start: week, week_end: addDays(week, 6), gross_amount: gross, charge_percent: carrier.charge_percent, amount: round(gross * Number(carrier.charge_percent) / 100), amount_paid: 0, status: "DRAFT", due_date: addDays(week, 13), review_note: null, submitted_at: null, forwarded_at: null, forwarded_by: null, paid_at: null, signed_off_at: null, signed_off_by: null };
-      const number = `DSP-${week.replaceAll("-", "")}-${truck.unit_number.replace(/[^A-Za-z0-9]/g, "").slice(0, 10).toUpperCase() || "TRUCK"}-${truck.id.slice(0, 4).toUpperCase()}`;
-      const { data, error } = existing
-        ? await supabase.from("dispatch_invoices").update(fields).eq("id", existing.id).select().single()
-        : await supabase.from("dispatch_invoices").insert({ ...fields, invoice_number: number }).select().single();
-      if (error) throw error;
-      await writeAudit(supabase, actor.id, "DISPATCH_INVOICE_CREATED", "dispatch_invoice", data.id, { to_status: "DRAFT", week_start: week, gross, amount: data.amount });
-      response.status(201).json({ invoice: data });
+      const ids = [...new Set(input.load_ids)];
+      const { data: loads } = await supabase.from("dispatch_loads").select("id, pickup_date, status, invoice_id").eq("truck_id", truck.id).in("id", ids);
+      if ((loads ?? []).length !== ids.length) return response.status(422).json({ error: "Some of those loads are not on this truck." });
+      if ((loads ?? []).some((load: any) => load.status === "CANCELLED")) return response.status(422).json({ error: "Cancelled loads can't be invoiced." });
+      if ((loads ?? []).some((load: any) => load.invoice_id)) return response.status(422).json({ error: "Some of those loads are already on another invoice." });
+      const dates = (loads ?? []).map((load: any) => load.pickup_date as string).sort();
+      const week = weekStart(dates[0]);
+      const number = `DSP-${week.replaceAll("-", "")}-${truck.unit_number.replace(/[^A-Za-z0-9]/g, "").slice(0, 10).toUpperCase() || "TRUCK"}-${crypto.randomUUID().slice(0, 6).toUpperCase()}`;
+      const { data: created, error } = await supabase.from("dispatch_invoices").insert({
+        invoice_number: number, truck_id: truck.id, carrier_id: carrier.id, dispatcher_id: truck.assigned_to, dispatch_department_id: truck.dispatch_department_id, sales_department_id: carrier.department_id, sales_agent_id: carrier.owner_id,
+        week_start: week, week_end: dates[dates.length - 1], gross_amount: 0, charge_percent: carrier.charge_percent, amount: 0, amount_paid: 0, status: "DRAFT", due_date: addDays(week, 13),
+      }).select("id").single();
+      if (error || !created) throw error;
+      const { error: linkError } = await supabase.from("dispatch_loads").update({ invoice_id: created.id }).in("id", ids).is("invoice_id", null);
+      if (linkError) { await supabase.from("dispatch_invoices").delete().eq("id", created.id); throw linkError; }
+      const invoice = await recomputeInvoice(supabase, created.id);
+      await writeAudit(supabase, actor.id, "DISPATCH_INVOICE_CREATED", "dispatch_invoice", created.id, { to_status: "DRAFT", loads: ids.length, gross: invoice?.gross_amount, amount: invoice?.amount });
+      response.status(201).json({ invoice });
+    } catch (error) { next(error); }
+  });
+
+  /** Add or remove loads and correct the figures. The Dispatcher edits Drafts; the Dispatch Manager edits at any stage. */
+  app.patch("/api/v1/dispatch/invoices/:id", ...guard, async (request: Req, response, next) => {
+    try {
+      const actor = request.actor!; const input = invoiceEditSchema.parse(request.body); const supabase = adminClient(); const scope = await teamScope(actor);
+      const [invoice] = await invoiceRows(supabase, (query) => query.eq("id", uuid.parse(request.params.id)));
+      if (!invoice) return response.status(404).json({ error: "Invoice not found." });
+      const truck = one(invoice.dispatch_trucks);
+      if (!invoiceEdit(actor, scope, invoice, truck)) return response.status(403).json({ error: invoice.status === "DRAFT" ? "You cannot edit this invoice." : "Only the Dispatch Manager can edit an invoice after it is submitted." });
+      if (invoice.status === "CANCELLED") return response.status(422).json({ error: "A cancelled invoice can't be edited." });
+      if (input.amount_paid !== undefined && !["FORWARDED", "PAID"].includes(invoice.status)) return response.status(422).json({ error: "Payment can be corrected once the invoice is forwarded." });
+      const adding = [...new Set(input.add_load_ids ?? [])]; const removing = [...new Set(input.remove_load_ids ?? [])];
+      if (adding.length) {
+        const { data: loads } = await supabase.from("dispatch_loads").select("id, status, invoice_id").eq("truck_id", invoice.truck_id).in("id", adding);
+        if ((loads ?? []).length !== adding.length || (loads ?? []).some((load: any) => load.status === "CANCELLED" || load.invoice_id)) return response.status(422).json({ error: "Only free, active loads of this truck can be added." });
+      }
+      if (removing.length) {
+        const { count } = await supabase.from("dispatch_loads").select("id", { count: "exact", head: true }).eq("invoice_id", invoice.id);
+        if ((count ?? 0) + adding.length - removing.length < 1) return response.status(422).json({ error: "An invoice needs at least one load. Delete it instead." });
+      }
+      const before = { gross_amount: invoice.gross_amount, charge_percent: invoice.charge_percent, amount: invoice.amount, amount_paid: invoice.amount_paid };
+      if (adding.length) await supabase.from("dispatch_loads").update({ invoice_id: invoice.id }).in("id", adding).is("invoice_id", null);
+      if (removing.length) await supabase.from("dispatch_loads").update({ invoice_id: null }).in("id", removing).eq("invoice_id", invoice.id);
+      let updated: any = adding.length || removing.length || input.charge_percent !== undefined ? await recomputeInvoice(supabase, invoice.id, input.charge_percent) : invoice;
+      // Typed figures override the calculation: a corrected gross recalculates the amount, a typed amount wins.
+      const manual: Record<string, number> = {};
+      if (input.gross_amount !== undefined) { manual.gross_amount = input.gross_amount; manual.amount = round(input.gross_amount * Number(input.charge_percent ?? updated.charge_percent) / 100); }
+      if (input.amount !== undefined) manual.amount = input.amount;
+      if (input.amount_paid !== undefined) manual.amount_paid = input.amount_paid;
+      if (Object.keys(manual).length) {
+        const { data, error } = await supabase.from("dispatch_invoices").update(manual).eq("id", invoice.id).select().single();
+        if (error) throw error;
+        updated = data;
+      }
+      const after = { gross_amount: updated.gross_amount, charge_percent: updated.charge_percent, amount: updated.amount, amount_paid: updated.amount_paid };
+      await writeAudit(supabase, actor.id, "DISPATCH_INVOICE_EDITED", "dispatch_invoice", invoice.id, { status: invoice.status, added_loads: adding.length, removed_loads: removing.length, before, after });
+      response.json({ invoice: updated });
+    } catch (error) { next(error); }
+  });
+
+  /** Deleting an invoice frees its loads to be invoiced again. The Dispatcher deletes Drafts; the Dispatch Manager any. */
+  app.delete("/api/v1/dispatch/invoices/:id", ...guard, async (request: Req, response, next) => {
+    try {
+      const actor = request.actor!; const supabase = adminClient(); const scope = await teamScope(actor);
+      const [invoice] = await invoiceRows(supabase, (query) => query.eq("id", uuid.parse(request.params.id)));
+      if (!invoice) return response.status(404).json({ error: "Invoice not found." });
+      if (!invoiceEdit(actor, scope, invoice, one(invoice.dispatch_trucks))) return response.status(403).json({ error: "Only the Dispatch Manager can delete an invoice after it is submitted." });
+      await supabase.from("dispatch_loads").update({ invoice_id: null }).eq("invoice_id", invoice.id);
+      const { error } = await supabase.from("dispatch_invoices").delete().eq("id", invoice.id); if (error) throw error;
+      await Promise.all([
+        supabase.from("record_comments").delete().eq("entity_type", "DISPATCH_INVOICE").eq("entity_id", invoice.id),
+        supabase.from("notifications").delete().eq("entity_type", "DISPATCH_INVOICE").eq("entity_id", invoice.id),
+      ]);
+      await writeAudit(supabase, actor.id, "DISPATCH_INVOICE_DELETED", "dispatch_invoice", invoice.id, { invoice_number: invoice.invoice_number, status: invoice.status, gross_amount: invoice.gross_amount, amount: invoice.amount, amount_paid: invoice.amount_paid });
+      response.json({ ok: true });
     } catch (error) { next(error); }
   });
 
@@ -777,12 +871,9 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       if (input.action === "RETURN" && !input.note) return response.status(422).json({ error: "Add a note explaining what to fix." });
       if (input.action === "SIGN_OFF" && invoice.signed_off_at) return response.status(422).json({ error: "This invoice is already signed off." });
       const update: Record<string, unknown> = { status: step.to };
-      if (input.action === "RECALCULATE") {
-        const loads = await grossByTruckWeek(supabase, [invoice.truck_id], invoice.week_start, invoice.week_end);
-        const gross = round(loads.reduce((sum: number, load: any) => sum + Number(load.rate), 0));
-        const percent = carrier.charge_percent ?? invoice.charge_percent;
-        Object.assign(update, { gross_amount: gross, charge_percent: percent, amount: round(gross * Number(percent) / 100) });
-      }
+      if (input.action === "RECALCULATE") await recomputeInvoice(supabase, invoice.id, Number(carrier.charge_percent ?? invoice.charge_percent));
+      // A cancelled invoice gives its loads back, so they can go on another invoice.
+      if (input.action === "CANCEL") await supabase.from("dispatch_loads").update({ invoice_id: null }).eq("invoice_id", invoice.id);
       if (input.action === "SUBMIT") Object.assign(update, { submitted_at: now, review_note: null });
       if (input.action === "RETURN") Object.assign(update, { review_note: input.note, submitted_at: null, forwarded_at: null, forwarded_by: null });
       if (input.action === "FORWARD") Object.assign(update, { forwarded_at: now, forwarded_by: actor.id, review_note: input.note || null });
@@ -798,7 +889,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
         if (input.action === "SUBMIT") return notify(supabase, await managersOf(supabase, invoice.dispatch_department_id), actor.id, "DISPATCH_INVOICE_SUBMITTED", "Weekly invoice to review", label, "DISPATCH_INVOICE", invoice.id);
         if (input.action === "RETURN") return notify(supabase, [invoice.dispatcher_id], actor.id, "DISPATCH_INVOICE_RETURNED", "Invoice returned", input.note!, "DISPATCH_INVOICE", invoice.id);
         if (input.action === "FORWARD") return notify(supabase, [invoice.dispatcher_id, ...await managersOf(supabase, invoice.sales_department_id)], actor.id, "DISPATCH_INVOICE_FORWARDED", "Invoice forwarded to accounting", label, "DISPATCH_INVOICE", invoice.id);
-        if (input.action === "PAY" && data.status === "PAID") return notify(supabase, [invoice.dispatcher_id, invoice.sales_agent_id, ...await managersOf(supabase, invoice.sales_department_id)], actor.id, "DISPATCH_INVOICE_PAID", "Invoice paid", label, "DISPATCH_INVOICE", invoice.id);
+        if (input.action === "PAY" && data.status === "PAID") return notify(supabase, [invoice.dispatcher_id, ...await managersOf(supabase, invoice.sales_department_id)], actor.id, "DISPATCH_INVOICE_PAID", "Invoice paid", label, "DISPATCH_INVOICE", invoice.id);
         if (input.action === "SIGN_OFF") return notify(supabase, [invoice.sales_agent_id, invoice.dispatcher_id], actor.id, "DISPATCH_INVOICE_SIGNED_OFF", "Sale signed off", label, "DISPATCH_INVOICE", invoice.id);
       };
       await Promise.all([
@@ -816,18 +907,20 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       const [invoice] = await invoiceRows(supabase, (query) => query.eq("id", uuid.parse(request.params.id)));
       if (!invoice) return response.status(404).json({ error: "Invoice not found." });
       const truck = one(invoice.dispatch_trucks); const carrier = one(invoice.dispatch_carriers);
-      if (!(truckOpsView(actor, scope, truck) || carrierSalesView(actor, scope, carrier) || invoiceReview(actor, scope, invoice, truck) || invoiceSignOff(actor, scope, invoice, carrier))) return response.status(403).json({ error: "This invoice is outside your work scope." });
-      const [{ data: loads }, { data: comments }, { data: history }] = await Promise.all([
-        supabase.from("dispatch_loads").select("*").eq("truck_id", invoice.truck_id).gte("pickup_date", invoice.week_start).lte("pickup_date", invoice.week_end).order("pickup_date"),
+      if (!(truckOpsView(actor, scope, truck) || (!moneyHidden(actor, scope) && carrierSalesView(actor, scope, carrier)) || invoiceReview(actor, scope, invoice, truck) || invoiceSignOff(actor, scope, invoice, carrier))) return response.status(403).json({ error: "This invoice is outside your work scope." });
+      const editable = invoice.status !== "CANCELLED" && invoiceEdit(actor, scope, invoice, truck);
+      const [{ data: loads }, { data: comments }, { data: history }, { data: free }] = await Promise.all([
+        supabase.from("dispatch_loads").select("*").eq("invoice_id", invoice.id).order("pickup_date"),
         supabase.from("record_comments").select("*").eq("entity_type", "DISPATCH_INVOICE").eq("entity_id", invoice.id).order("created_at", { ascending: false }),
         supabase.from("audit_events").select("id, actor_id, action, detail, created_at").eq("entity_type", "dispatch_invoice").eq("entity_id", invoice.id).order("created_at", { ascending: false }),
+        editable ? supabase.from("dispatch_loads").select("*").eq("truck_id", invoice.truck_id).is("invoice_id", null).neq("status", "CANCELLED").order("pickup_date", { ascending: false }).limit(200) : Promise.resolve({ data: [] as any[] }),
       ]);
       const people = await names(supabase, [invoice.dispatcher_id, invoice.sales_agent_id, ...(history ?? []).map((row: any) => row.actor_id)]);
       response.json({
-        invoice: decorate(invoice, people), loads: loads ?? [],
+        invoice: decorate(invoice, people), loads: loads ?? [], available_loads: free ?? [],
         comments: await withAuthorDetails(supabase, comments ?? [], actor.id, isManager(actor) || isSuper(actor)),
         history: (history ?? []).map((row: any) => ({ ...row, actor_name: people.get(row.actor_id) ?? null })),
-        rights: { dispatcher: truckOpsUpdate(actor, scope, truck), reviewer: invoiceReview(actor, scope, invoice, truck), sign_off: invoiceSignOff(actor, scope, invoice, carrier) },
+        rights: { dispatcher: truckOpsUpdate(actor, scope, truck), reviewer: invoiceReview(actor, scope, invoice, truck), sign_off: invoiceSignOff(actor, scope, invoice, carrier), edit: editable },
       });
     } catch (error) { next(error); }
   });
@@ -915,6 +1008,8 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       const inRange = (day: string) => (!range.from || day >= range.from) && (!range.to || day <= range.to);
       const truckOf = new Map(trucks.map((truck: any) => [truck.id, truck]));
       const owed = (invoice: any) => invoice.status === "CANCELLED" ? 0 : Math.max(0, Number(invoice.amount) - Number(invoice.amount_paid));
+      const activeSince = await firstPaid(supabase, truckIds);
+      const activeIn = (truck: any) => { const since = activeSince.get(truck.id)?.slice(0, 10); return Boolean(since && inRange(since)); };
 
       // People rows: agents (sales) or dispatchers (operations).
       const peopleIds = [...new Set([...trucks.map(personOf), ...scopedCarriers.map((carrier: any) => sales ? carrier.owner_id : null)].filter(Boolean))] as string[];
@@ -935,7 +1030,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
           id, name: people.get(id) ?? "Unknown",
           carriers: myCarriers.length, pending: myCarriers.filter((carrier: any) => ["DOCS_PENDING", "PENDING_REVIEW", "RETURNED"].includes(carrier.review_status)).length,
           discarded: myCarriers.filter((carrier: any) => carrier.review_status === "DISCARDED").length + mine.filter((truck: any) => ["DISCARDED", "DNC"].includes(truck.status)).length,
-          trucks: mine.length, active: mine.filter((truck: any) => truck.status === "RUNNING").length, onboarded: mine.filter((truck: any) => ["ACTIVE", "ONBOARDED", "RUNNING", "INACTIVE"].includes(truck.status)).length,
+          trucks: mine.length, active: mine.filter((truck: any) => truck.status === "RUNNING").length, active_sales: mine.filter(activeIn).length, active_sales_total: mine.filter((truck: any) => activeSince.has(truck.id)).length, onboarded: mine.filter((truck: any) => ["ACTIVE", "ONBOARDED", "RUNNING", "INACTIVE"].includes(truck.status)).length,
           loads: myLoads.filter((load: any) => inRange(load.pickup_date)).length,
           week_gross: round(weekGross), month_gross: round(monthGross), period_gross: round(periodGross),
           weekly_target: weeklyTarget, monthly_target: monthlyTarget,
@@ -963,7 +1058,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
         const truckLoads = loads.filter((load: any) => load.truck_id === truck.id);
         const truckInvoices = invoices.filter((invoice: any) => invoice.truck_id === truck.id);
         return {
-          id: truck.id, unit_number: truck.unit_number, truck_type: truck.truck_type, status: truck.status, carrier: truck.carrier.company_name, dispatcher: truck.assigned_to ? truckPeople.get(truck.assigned_to) ?? null : null,
+          id: truck.id, unit_number: truck.unit_number, truck_type: truck.truck_type, status: truck.status, carrier: truck.carrier.company_name, dispatcher: truck.assigned_to ? truckPeople.get(truck.assigned_to) ?? null : null, sale_active_since: activeSince.get(truck.id) ?? null,
           loads: truckLoads.filter((load: any) => inRange(load.pickup_date)).length,
           week_gross: round(truckLoads.filter((load: any) => load.pickup_date >= thisWeek).reduce((sum: number, load: any) => sum + Number(load.rate), 0)),
           gross: round(truckLoads.filter((load: any) => inRange(load.pickup_date)).reduce((sum: number, load: any) => sum + Number(load.rate), 0)),
@@ -974,9 +1069,12 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
 
       const tally = (rows: any[], key: string) => rows.reduce((totals: Record<string, number>, row: any) => { totals[row[key]] = (totals[row[key]] ?? 0) + 1; return totals; }, {});
       const periodLoads = loads.filter((load: any) => inRange(load.pickup_date));
+      const hidden = moneyHidden(actor, scope);
+      const moneyKeys = ["week_gross", "month_gross", "period_gross", "weekly_target", "monthly_target", "gross", "revenue", "collected", "outstanding", "signed_off"];
+      const strip = <T extends Record<string, any>>(row: T): T => hidden ? Object.fromEntries(Object.entries(row).filter(([key]) => !moneyKeys.includes(key))) as T : row;
       response.json({
         side: sales ? "SALES" : "OPERATIONS", team_view: teamView, week_start: thisWeek, month_start: thisMonth,
-        totals: {
+        totals: strip({
           carriers: scopedCarriers.length, trucks: trucks.length,
           running: trucks.filter((truck: any) => truck.status === "RUNNING").length,
           onboarded: trucks.filter((truck: any) => ["ACTIVE", "ONBOARDED", "RUNNING", "INACTIVE"].includes(truck.status)).length,
@@ -989,11 +1087,13 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
           collected: round(invoices.reduce((sum: number, invoice: any) => sum + Number(invoice.amount_paid), 0)),
           outstanding: round(invoices.reduce((sum: number, invoice: any) => sum + owed(invoice), 0)),
           signed_off: round(invoices.filter((invoice: any) => invoice.signed_off_at).reduce((sum: number, invoice: any) => sum + Number(invoice.amount), 0)),
-        },
-        people: byPerson, carriers: byCarrier, trucks: byTruck,
-        carrier_statuses: tally(scopedCarriers, "review_status"), truck_statuses: tally(trucks, "status"), invoice_statuses: tally(invoices, "status"),
+          active_sales: trucks.filter(activeIn).length, active_sales_total: trucks.filter((truck: any) => activeSince.has(truck.id)).length,
+        }),
+        money_hidden: hidden,
+        people: byPerson.map(strip), carriers: byCarrier.map(strip), trucks: byTruck.map(strip),
+        carrier_statuses: tally(scopedCarriers, "review_status"), truck_statuses: tally(trucks, "status"), invoice_statuses: hidden ? {} : tally(invoices, "status"),
         agents: peopleIds.map((id) => ({ id, full_name: people.get(id) ?? "Unknown" })).sort((left, right) => left.full_name.localeCompare(right.full_name)),
-        load_rows: periodLoads.slice(0, 2000).map((load: any) => ({ ...load, truck: truckOf.get(load.truck_id)?.unit_number ?? null, carrier: truckOf.get(load.truck_id)?.carrier.company_name ?? null })),
+        load_rows: hidden ? [] : periodLoads.slice(0, 2000).map((load: any) => ({ ...load, truck: truckOf.get(load.truck_id)?.unit_number ?? null, carrier: truckOf.get(load.truck_id)?.carrier.company_name ?? null })),
       });
     } catch (error) { next(error); }
   });

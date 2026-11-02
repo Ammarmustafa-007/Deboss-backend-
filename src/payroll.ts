@@ -688,7 +688,9 @@ export function registerPayrollRoutes(app: Express, { adminClient, requireSuperA
       const period = periodSchema.parse(request.query.period ?? currentPeriod());
       const figures = await monthFigures(adminClient(), period);
       const line = figures.lines.find((row) => row.user_id === actor.id);
-      response.json({ period, progress: line ? progressOf(line, figures.rules, figures.departmentIncome(line)) : null });
+      const progress = line ? progressOf(line, figures.rules, figures.departmentIncome(line)) : null;
+      // Client feedback: a Dispatch Sales Agent sees their active sales, not the gross behind them.
+      response.json({ period, progress: progress && line!.role_key === "DISPATCH_SALES_AGENT" ? { ...progress, gross: null } : progress });
     } catch (error) { next(error); }
   });
 

@@ -92,8 +92,8 @@ async function requireBrokerageUser(request: BrokerageRequest, response: Respons
   } catch (error) { next(error); }
 }
 
-const createUserSchema = z.object({ full_name: z.string().trim().min(2).max(100), email: z.string().trim().email(), password: z.string().min(8).max(128), role: z.enum(["SUPER_ADMIN", "MANAGER", "AGENT"]), department_id: z.string().uuid().nullable().optional() });
-const updateUserSchema = z.object({ full_name: z.string().trim().min(2).max(100).optional(), role: z.enum(["SUPER_ADMIN", "MANAGER", "AGENT"]).optional(), department_id: z.string().uuid().nullable().optional(), is_active: z.boolean().optional(), password: z.string().min(8).max(128).optional() });
+const createUserSchema = z.object({ full_name: z.string().trim().min(2).max(100), email: z.string().trim().email(), password: z.string().min(8).max(128), role: z.enum(["SUPER_ADMIN", "MANAGER", "AGENT"]), department_id: z.string().uuid().nullable().optional(), sales_agent_id: z.string().uuid().nullable().optional() });
+const updateUserSchema = z.object({ full_name: z.string().trim().min(2).max(100).optional(), role: z.enum(["SUPER_ADMIN", "MANAGER", "AGENT"]).optional(), department_id: z.string().uuid().nullable().optional(), is_active: z.boolean().optional(), password: z.string().min(8).max(128).optional(), sales_agent_id: z.string().uuid().nullable().optional() });
 // Company details a lead can carry (also filled from a Fronter's sheet when a mined prospect is qualified).
 const leadDetailSchema = { operator_name: z.string().trim().max(160).nullable().optional(), operator_number: z.string().trim().max(60).nullable().optional(), truck_type: z.string().trim().max(80).nullable().optional(), load_type: z.enum(["FTL", "LTL", "BOTH"]).nullable().optional(), shipping_volume: z.string().trim().max(80).nullable().optional(), commodity: z.string().trim().max(120).nullable().optional(), lanes: z.string().trim().max(500).nullable().optional(), physical_address: z.string().trim().max(300).nullable().optional(), other_locations: z.string().trim().max(500).nullable().optional(), billing_address: z.string().trim().max(300).nullable().optional(), billing_contact: z.string().trim().max(160).nullable().optional(), billing_phone: z.string().trim().max(40).nullable().optional(), billing_email: z.string().trim().email().max(200).nullable().optional().or(z.literal("")), payment_terms: z.string().trim().max(80).nullable().optional(), w9_received: z.boolean().optional(), ein: z.string().trim().max(40).nullable().optional(), website: z.string().trim().max(200).nullable().optional() };
 const leadSchema = z.object({ company_name: z.string().trim().min(2), contact_name: z.string().trim().optional(), contact_email: z.string().email().optional().or(z.literal("")), contact_phone: z.string().trim().optional(), estimated_monthly_value: z.number().nonnegative().optional(), next_follow_up_at: z.string().datetime().optional(), source: z.string().trim().optional(), notes: z.string().trim().optional(), ...leadDetailSchema });
@@ -321,20 +321,33 @@ app.get("/health", (_request, response) => response.json({ status: "ok", service
 
 app.get("/api/v1/users", requireSuperAdmin, async (_request, response, next) => {
   try {
-    const { data, error } = await adminClient().from("profiles").select("id, full_name, email, role, is_active, created_at, departments!profiles_department_id_fkey(id, name, business_unit, function)").order("created_at", { ascending: false });
+    const { data, error } = await adminClient().from("profiles").select("id, full_name, email, role, is_active, created_at, sales_agent_id, departments!profiles_department_id_fkey(id, name, business_unit, function)").order("created_at", { ascending: false });
     if (error) throw error;
     response.json({ users: data });
   } catch (error) { next(error); }
 });
+
+/** Fronters work for one Brokerage Sales agent; anyone else has none. Returns an error message, or null when it is fine. */
+async function salesAgentProblem(supabase: ReturnType<typeof adminClient>, departmentId: string | null | undefined, salesAgentId: string | null | undefined) {
+  const { data: department } = departmentId ? await supabase.from("departments").select("business_unit, function").eq("id", departmentId).maybeSingle() : { data: null };
+  const fronter = department?.business_unit === "BROKERAGE" && department?.function === "FRONTER";
+  if (!fronter) return salesAgentId ? "Only Fronters are linked to a Sales agent." : null;
+  if (!salesAgentId) return "Choose the Sales agent this Fronter works for.";
+  const { data: agent } = await supabase.from("profiles").select("id, role, is_active, departments!profiles_department_id_fkey(business_unit, function)").eq("id", salesAgentId).maybeSingle();
+  const agentDepartment = Array.isArray(agent?.departments) ? agent?.departments[0] : agent?.departments;
+  return agent?.is_active && agent.role === "AGENT" && agentDepartment?.business_unit === "BROKERAGE" && agentDepartment?.function === "SALES" ? null : "Choose an active Brokerage Sales agent.";
+}
 
 app.post("/api/v1/users", requireSuperAdmin, async (request, response, next) => {
   try {
     const input = createUserSchema.parse(request.body);
     const supabase = adminClient();
     if (input.role !== "SUPER_ADMIN" && !input.department_id) return response.status(422).json({ error: "A departmental role requires a department." });
+    const agentProblem = await salesAgentProblem(supabase, input.role === "SUPER_ADMIN" ? null : input.department_id, input.sales_agent_id);
+    if (agentProblem) return response.status(422).json({ error: agentProblem });
     const { data: created, error: createError } = await supabase.auth.admin.createUser({ email: input.email, password: input.password, email_confirm: true });
     if (createError || !created.user) return response.status(422).json({ error: createError?.message ?? "Unable to create the user." });
-    const { data: profile, error: updateError } = await supabase.from("profiles").update({ full_name: input.full_name, email: input.email, role: input.role, department_id: input.role === "SUPER_ADMIN" ? null : input.department_id, is_active: true }).eq("id", created.user.id).select().single();
+    const { data: profile, error: updateError } = await supabase.from("profiles").update({ full_name: input.full_name, email: input.email, role: input.role, department_id: input.role === "SUPER_ADMIN" ? null : input.department_id, sales_agent_id: input.sales_agent_id ?? null, is_active: true }).eq("id", created.user.id).select().single();
     if (updateError) { await supabase.auth.admin.deleteUser(created.user.id); throw updateError; }
     await writeAudit(supabase, (request as AuthenticatedRequest).actor!.id, "USER_CREATED", "profile", created.user.id, { role: input.role, department_id: profile.department_id });
     response.status(201).json({ user: profile });
@@ -347,7 +360,13 @@ app.patch("/api/v1/users/:id", requireSuperAdmin, async (request, response, next
     const input = updateUserSchema.parse(request.body);
     const supabase = adminClient();
     const { password, ...profileUpdate } = input;
-    if (profileUpdate.role === "SUPER_ADMIN") profileUpdate.department_id = null;
+    if (profileUpdate.role === "SUPER_ADMIN") { profileUpdate.department_id = null; profileUpdate.sales_agent_id = null; }
+    if (profileUpdate.department_id !== undefined || profileUpdate.sales_agent_id !== undefined) {
+      const { data: current } = await supabase.from("profiles").select("department_id, sales_agent_id").eq("id", userId).maybeSingle();
+      const departmentId = profileUpdate.department_id !== undefined ? profileUpdate.department_id : current?.department_id;
+      const agentProblem = await salesAgentProblem(supabase, departmentId, profileUpdate.sales_agent_id !== undefined ? profileUpdate.sales_agent_id : current?.sales_agent_id);
+      if (agentProblem) return response.status(422).json({ error: agentProblem });
+    }
     if (password) {
       const { error } = await supabase.auth.admin.updateUserById(userId, { password });
       if (error) return response.status(422).json({ error: error.message });
@@ -359,6 +378,33 @@ app.patch("/api/v1/users/:id", requireSuperAdmin, async (request, response, next
       if (error) throw error;
       return response.json({ user: data });
     }
+    response.status(204).end();
+  } catch (error) { next(error); }
+});
+
+/** Deletes a user with no work in the CRM; anyone with history is refused and should be deactivated instead. */
+app.delete("/api/v1/users/:id", requireSuperAdmin, async (request, response, next) => {
+  try {
+    const userId = z.string().uuid().parse(request.params.id);
+    const actorId = (request as AuthenticatedRequest).actor!.id;
+    if (userId === actorId) return response.status(422).json({ error: "You can't delete your own account." });
+    const supabase = adminClient();
+    const { data: person } = await supabase.from("profiles").select("id, full_name, email, role").eq("id", userId).maybeSingle();
+    if (!person) return response.status(404).json({ error: "User not found." });
+    if (person.role === "SUPER_ADMIN") {
+      const { count } = await supabase.from("profiles").select("id", { count: "exact", head: true }).eq("role", "SUPER_ADMIN").eq("is_active", true).neq("id", userId);
+      if (!count) return response.status(422).json({ error: "This is the only active Super Admin." });
+    }
+    const { data: result, error } = await supabase.rpc("delete_unused_user", { target: userId });
+    if (error) throw error;
+    if (result === "NOT_FOUND") return response.status(404).json({ error: "User not found." });
+    if (String(result).startsWith("IN_USE")) {
+      const table = /on table "(\w+)"/.exec(String(result).split(":").slice(1).join(":").split("violates")[1] ?? "")?.[1] ?? "";
+      const work: Record<string, string> = { audit_events: "activity history", sales_leads: "leads", lead_activities: "lead activity", brokerage_customers: "customers", brokerage_shipments: "loads", chat_messages: "chat messages", record_comments: "comments", dispatch_carriers: "carriers", dispatch_loads: "loads", dispatch_invoices: "invoices", fronter_prospects: "mined prospects", payroll_lines: "payroll" };
+      return response.status(409).json({ error: `${person.full_name} has ${work[table] ?? "work"} in the CRM, so deleting would break those records. Deactivate the user instead.` });
+    }
+    clearAccessCache(userId);
+    await writeAudit(supabase, actorId, "USER_DELETED", "profile", userId, { full_name: person.full_name, email: person.email, role: person.role });
     response.status(204).end();
   } catch (error) { next(error); }
 });
