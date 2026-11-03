@@ -198,7 +198,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
   /** Weekly gross per truck from its loads (answer 3): every non-cancelled load counts in the week it is picked up. */
   async function grossByTruckWeek(supabase: SupabaseClient, truckIds: string[], from?: string, to?: string) {
     if (!truckIds.length) return [] as any[];
-    let query = supabase.from("dispatch_loads").select("id, truck_id, dispatcher_id, pickup_date, rate, status").in("truck_id", truckIds).neq("status", "CANCELLED");
+    let query = supabase.from("dispatch_loads").select("id, truck_id, dispatcher_id, pickup_date, rate, miles, status").in("truck_id", truckIds).neq("status", "CANCELLED");
     if (from) query = query.gte("pickup_date", from);
     if (to) query = query.lte("pickup_date", to);
     const { data, error } = await query;
@@ -319,7 +319,22 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       const { data: department } = carrier.dispatch_department_id ? await supabase.from("departments").select("name").eq("id", carrier.dispatch_department_id).maybeSingle() : { data: null };
       const missing = requiredDocuments.filter((type) => !(documents ?? []).some((row: any) => row.document_type === type));
       const activeSince = await firstPaid(supabase, visibleTrucks.map((truck: any) => truck.id));
+      // The company at a glance (client feedback): trucks running, this week's paid gross and miles, invoices received.
+      const truckIds = visibleTrucks.map((truck: any) => truck.id);
+      const thisWeek = weekStart(new Date()); const thisMonth = monthStart(new Date().toISOString().slice(0, 10));
+      const [{ data: paidRows }, weekLoads] = truckIds.length && !hidden ? await Promise.all([
+        supabase.from("dispatch_invoices").select("amount_paid, paid_at").in("truck_id", truckIds).eq("status", "PAID"),
+        grossByTruckWeek(supabase, truckIds, thisWeek),
+      ]) : [{ data: [] as any[] }, [] as any[]];
+      const paidSince = (day: string) => round((paidRows ?? []).filter((row: any) => String(row.paid_at).slice(0, 10) >= day).reduce((sum: number, row: any) => sum + Number(row.amount_paid), 0));
+      const summary = hidden ? null : {
+        trucks: visibleTrucks.length, running: visibleTrucks.filter((truck: any) => truck.status === "RUNNING").length,
+        week_gross: paidSince(thisWeek), month_gross: paidSince(thisMonth),
+        week_miles: weekLoads.reduce((sum: number, load: any) => sum + Number(load.miles ?? 0), 0), week_loads: weekLoads.length,
+        invoices_received: (paidRows ?? []).length, received_total: round((paidRows ?? []).reduce((sum: number, row: any) => sum + Number(row.amount_paid), 0)),
+      };
       response.json({
+        summary,
         carrier: { ...carrier, owner_name: people.get(carrier.owner_id) ?? null, reviewed_by_name: carrier.reviewed_by ? people.get(carrier.reviewed_by) ?? null : null, team_name: carrier.team_id ? teamsById.get(carrier.team_id) ?? null : null, dispatch_department_name: department?.name ?? null },
         trucks: visibleTrucks.map((truck: any) => ({ ...truck, assigned_name: truck.assigned_to ? people.get(truck.assigned_to) ?? null : null, team_name: truck.team_id ? teamsById.get(truck.team_id) ?? null : null, sale_active_since: activeSince.get(truck.id) ?? null })),
         documents: (documents ?? []).map((row: any) => ({ ...row, uploaded_by_name: people.get(row.uploaded_by) ?? null })),
@@ -563,13 +578,14 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       const people = await names(supabase, rows.map((row: any) => row.assigned_to));
       const teamsById = await teamNames(supabase, rows.map((row: any) => row.team_id));
       const hidden = moneyHidden(actor, scope); const activeSince = await firstPaid(supabase, rows.map((row: any) => row.id));
-      const { data: paidThisWeek } = rows.length ? await supabase.from("dispatch_invoices").select("truck_id, amount_paid").in("truck_id", rows.map((row: any) => row.id)).eq("status", "PAID").gte("paid_at", `${thisWeek}T00:00:00Z`) : { data: [] as any[] };
+      const { data: paidInvoices } = rows.length ? await supabase.from("dispatch_invoices").select("truck_id, amount_paid, paid_at").in("truck_id", rows.map((row: any) => row.id)).eq("status", "PAID") : { data: [] as any[] };
       response.json({ week_start: thisWeek, trucks: rows.map((truck: any) => {
         const mine = loads.filter((load: any) => load.truck_id === truck.id);
         const week = mine.filter((load: any) => weekStart(load.pickup_date) === thisWeek);
-        const paidWeek = (paidThisWeek ?? []).filter((invoice: any) => invoice.truck_id === truck.id);
-        const row = { ...truck, carrier: one(truck.dispatch_carriers), dispatch_carriers: undefined, assigned_name: truck.assigned_to ? people.get(truck.assigned_to) ?? null : null, team_name: truck.team_id ? teamsById.get(truck.team_id) ?? null : null, week_gross: round(paidWeek.reduce((sum: number, invoice: any) => sum + Number(invoice.amount_paid), 0)), week_loads: week.length, last_load_date: mine.map((load: any) => load.pickup_date).sort().pop() ?? null, sale_active_since: activeSince.get(truck.id) ?? null };
-        return hidden ? { ...row, week_gross: null, week_loads: null, last_load_date: null } : row;
+        const paidAll = (paidInvoices ?? []).filter((invoice: any) => invoice.truck_id === truck.id);
+        const paidWeek = paidAll.filter((invoice: any) => String(invoice.paid_at).slice(0, 10) >= thisWeek);
+        const row = { ...truck, carrier: one(truck.dispatch_carriers), dispatch_carriers: undefined, assigned_name: truck.assigned_to ? people.get(truck.assigned_to) ?? null : null, team_name: truck.team_id ? teamsById.get(truck.team_id) ?? null : null, week_gross: round(paidWeek.reduce((sum: number, invoice: any) => sum + Number(invoice.amount_paid), 0)), week_loads: week.length, week_miles: week.reduce((sum: number, load: any) => sum + Number(load.miles ?? 0), 0), paid_invoices: paidAll.length, paid_total: round(paidAll.reduce((sum: number, invoice: any) => sum + Number(invoice.amount_paid), 0)), last_load_date: mine.map((load: any) => load.pickup_date).sort().pop() ?? null, sale_active_since: activeSince.get(truck.id) ?? null };
+        return hidden ? { ...row, week_gross: null, week_loads: null, week_miles: null, paid_invoices: null, paid_total: null, last_load_date: null } : row;
       }) });
     } catch (error) { next(error); }
   });
@@ -617,7 +633,11 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       if (input.assigned_to !== undefined || input.team_id !== undefined) {
         if (!truck.dispatch_department_id) return response.status(422).json({ error: "This truck has not been handed to Dispatch Operations yet." });
         if (!truckAssign(actor, scope, truck)) return response.status(403).json({ error: "Only the Dispatch Manager can assign trucks." });
-        if (input.assigned_to && !await departmentPeople(supabase, truck.dispatch_department_id, [input.assigned_to])) return response.status(422).json({ error: "The Dispatcher must be active in this Dispatch Operations department." });
+        // Client feedback: a Dispatch manager can run trucks like a Dispatcher, including assigning one to themselves.
+        if (input.assigned_to && !await departmentPeople(supabase, truck.dispatch_department_id, [input.assigned_to])) {
+          const { data: manager } = await supabase.from("profiles").select("id").eq("id", input.assigned_to).eq("department_id", truck.dispatch_department_id).eq("role", "MANAGER").eq("is_active", true).maybeSingle();
+          if (!manager) return response.status(422).json({ error: "The Dispatcher must be an active agent or manager in this Dispatch Operations department." });
+        }
         if (!isSuper(actor) && !isManager(actor)) {
           if (input.assigned_to && !scope.memberIds.includes(input.assigned_to)) return response.status(403).json({ error: "You can assign trucks only to members of your team." });
           if (input.team_id !== undefined && (!input.team_id || !scope.leadTeamIds.includes(input.team_id))) return response.status(403).json({ error: "You can move trucks only between your own teams." });

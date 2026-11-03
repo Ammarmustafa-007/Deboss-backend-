@@ -131,3 +131,11 @@ test("the Sales Agent sees active sales, never invoices or gross", async () => {
   // The Sales Manager still sees every invoice: the paid one and the cancelled one.
   assert.equal(manager.body.invoices.length, 2);
 });
+
+test("a Dispatch manager can take a truck themselves, like a Dispatcher", async () => {
+  const self = await call(people.manager, `/api/v1/dispatch/trucks/${truck.id}`, "PATCH", { assigned_to: people.manager.id });
+  assert.equal(self.status, 200, JSON.stringify(self.body));
+  assert.equal(tables.dispatch_trucks[0].assigned_to, people.manager.id);
+  assert.equal((await call(people.manager, `/api/v1/dispatch/trucks/${truck.id}`, "PATCH", { assigned_to: people.salesManager.id })).status, 422);
+  await call(people.manager, `/api/v1/dispatch/trucks/${truck.id}`, "PATCH", { assigned_to: people.dispatcher.id });
+});
