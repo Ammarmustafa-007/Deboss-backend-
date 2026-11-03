@@ -972,7 +972,8 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       const { data: people } = await peopleQuery;
       const ids = (people ?? []).map((row: any) => row.id);
       const { data: targets } = ids.length ? await supabase.from("dispatch_targets").select("*").in("user_id", ids) : { data: [] as any[] };
-      response.json({ can_edit: isManager(actor) || isSuper(actor), people: (people ?? []).map((person: any) => ({ ...person, weekly: targets?.find((row: any) => row.user_id === person.id && row.period_type === "WEEKLY")?.amount ?? null, monthly: targets?.find((row: any) => row.user_id === person.id && row.period_type === "MONTHLY")?.amount ?? null })) });
+      // Client feedback: Dispatch Sales targets are a number of sales (active trucks); Dispatch Operations targets are gross.
+      response.json({ can_edit: isManager(actor) || isSuper(actor), unit: isDispatchSales(actor) ? "SALES" : "GROSS", people: (people ?? []).map((person: any) => ({ ...person, weekly: targets?.find((row: any) => row.user_id === person.id && row.period_type === "WEEKLY")?.amount ?? null, monthly: targets?.find((row: any) => row.user_id === person.id && row.period_type === "MONTHLY")?.amount ?? null })) });
     } catch (error) { next(error); }
   });
 
@@ -981,6 +982,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       const actor = request.actor!; const input = targetSchema.parse(request.body); const supabase = adminClient(); const userId = uuid.parse(request.params.userId);
       if (!isSuper(actor) && !isManager(actor)) return response.status(403).json({ error: "Only a Dispatch manager can set targets." });
       if (!isSuper(actor) && !await departmentPeople(supabase, actor.department_id!, [userId])) return response.status(422).json({ error: "Targets can be set only for agents in your department." });
+      if (isDispatchSales(actor) && !Number.isInteger(input.amount)) return response.status(422).json({ error: "A sales target is a whole number of sales." });
       const { data, error } = await supabase.from("dispatch_targets").upsert({ user_id: userId, period_type: input.period_type, amount: input.amount, set_by: actor.id, updated_at: new Date().toISOString() }).select().single(); if (error) throw error;
       await writeAudit(supabase, actor.id, "DISPATCH_TARGET_SET", "profile", userId, { period_type: input.period_type, amount: input.amount });
       response.json({ target: data });
@@ -1043,7 +1045,8 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
           id, name: people.get(id) ?? "Unknown",
           carriers: myCarriers.length, pending: myCarriers.filter((carrier: any) => ["DOCS_PENDING", "PENDING_REVIEW", "RETURNED"].includes(carrier.review_status)).length,
           discarded: myCarriers.filter((carrier: any) => carrier.review_status === "DISCARDED").length + mine.filter((truck: any) => ["DISCARDED", "DNC"].includes(truck.status)).length,
-          trucks: mine.length, active: mine.filter((truck: any) => truck.status === "RUNNING").length, active_sales: mine.filter(activeIn).length, active_sales_total: mine.filter((truck: any) => activeSince.has(truck.id)).length, onboarded: mine.filter((truck: any) => ["ACTIVE", "ONBOARDED", "RUNNING", "INACTIVE"].includes(truck.status)).length,
+          trucks: mine.length, active: mine.filter((truck: any) => truck.status === "RUNNING").length, active_sales: mine.filter(activeIn).length, active_sales_total: mine.filter((truck: any) => activeSince.has(truck.id)).length,
+          active_week: mine.filter((truck: any) => (activeSince.get(truck.id)?.slice(0, 10) ?? "") >= thisWeek).length, active_month: mine.filter((truck: any) => (activeSince.get(truck.id)?.slice(0, 10) ?? "") >= thisMonth).length, onboarded: mine.filter((truck: any) => ["ACTIVE", "ONBOARDED", "RUNNING", "INACTIVE"].includes(truck.status)).length,
           loads: myLoads.filter((load: any) => inRange(load.pickup_date)).length,
           week_gross: round(weekGross), month_gross: round(monthGross), period_gross: round(periodGross),
           weekly_target: weeklyTarget, monthly_target: monthlyTarget,
@@ -1084,7 +1087,9 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       const periodLoads = loads.filter((load: any) => inRange(load.pickup_date));
       const hidden = moneyHidden(actor, scope);
       const moneyKeys = ["week_gross", "month_gross", "period_gross", "weekly_target", "monthly_target", "gross", "revenue", "collected", "outstanding", "signed_off"];
-      const strip = <T extends Record<string, any>>(row: T): T => hidden ? Object.fromEntries(Object.entries(row).filter(([key]) => !moneyKeys.includes(key))) as T : row;
+      // On the Sales side targets are a number of sales, so the agent keeps seeing them.
+      const hiddenKeys = sales ? moneyKeys.filter((key) => !["weekly_target", "monthly_target"].includes(key)) : moneyKeys;
+      const strip = <T extends Record<string, any>>(row: T): T => hidden ? Object.fromEntries(Object.entries(row).filter(([key]) => !hiddenKeys.includes(key))) as T : row;
       response.json({
         side: sales ? "SALES" : "OPERATIONS", team_view: teamView, week_start: thisWeek, month_start: thisMonth,
         totals: strip({
@@ -1101,6 +1106,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
           outstanding: round(invoices.reduce((sum: number, invoice: any) => sum + owed(invoice), 0)),
           signed_off: round(invoices.filter((invoice: any) => invoice.signed_off_at).reduce((sum: number, invoice: any) => sum + Number(invoice.amount), 0)),
           active_sales: trucks.filter(activeIn).length, active_sales_total: trucks.filter((truck: any) => activeSince.has(truck.id)).length,
+          active_week: trucks.filter((truck: any) => (activeSince.get(truck.id)?.slice(0, 10) ?? "") >= thisWeek).length, active_month: trucks.filter((truck: any) => (activeSince.get(truck.id)?.slice(0, 10) ?? "") >= thisMonth).length,
         }),
         money_hidden: hidden,
         people: byPerson.map(strip), carriers: byCarrier.map(strip), trucks: byTruck.map(strip),
