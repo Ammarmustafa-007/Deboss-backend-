@@ -103,7 +103,7 @@ const teamSchema = z.object({ name: z.string().trim().min(2).max(80), team_lead_
   // The team's chat group (name and photo); the group's members always follow the team.
   group_name: z.preprocess((value) => value === "" ? undefined : value, z.string().trim().min(2).max(80).optional()), group_photo_url: z.string().url().max(500).nullable().optional() });
 const teamUpdateSchema = teamSchema.partial().extend({ is_active: z.boolean().optional() });
-const leadUpdateSchema = leadSchema.partial().extend({ stage: z.enum(["LEAD", "QUALIFIED", "NOT_QUALIFIED", "NOT_INTERESTED", "QUOTING", "CUSTOMER"]).optional(), owner_id: z.string().uuid().optional(), team_id: z.string().uuid().nullable().optional(), archived_at: z.string().datetime().nullable().optional(), estimated_monthly_value: z.number().nonnegative().nullable().optional(), next_follow_up_at: z.string().datetime().nullable().optional() });
+const leadUpdateSchema = leadSchema.partial().extend({ stage: z.enum(["LEAD", "QUALIFIED", "NOT_QUALIFIED", "NOT_INTERESTED", "QUOTING", "CUSTOMER"]).optional(), owner_id: z.string().uuid().optional(), team_id: z.string().uuid().nullable().optional(), archived_at: z.string().datetime().nullable().optional(), estimated_monthly_value: z.number().nonnegative().nullable().optional(), next_follow_up_at: z.string().datetime().nullable().optional(), notes: z.string().trim().max(10000).nullable().optional() });
 const activitySchema = z.object({ activity_type: z.enum(["CALL", "CALLBACK", "EMAIL", "NOTE", "FOLLOW_UP", "APPOINTMENT"]), body: z.string().trim().min(1).max(3000), due_at: z.string().datetime().nullable().optional() });
 const activityCompletionSchema = z.object({ completed: z.boolean() });
 const quoteUpdateSchema = quoteSchema.omit({ lead_id: true }).partial();
@@ -112,7 +112,7 @@ const reviewSchema = z.object({ action: z.enum(["APPROVE", "REJECT"]), note: z.s
 });
 const handoffSchema = z.object({ operations_department_id: z.string().uuid(), reference_number: z.string().trim().min(3).max(64), customer_name: z.string().trim().min(2), team_id: z.string().uuid().nullable().optional() });
 // Load details the Operations Agent records (migration 019). Carrier identity never goes to Brokerage Sales (see withoutCarrier).
-const loadDetailSchema = { carrier_mc: z.string().trim().max(40).nullable().optional(), dispatcher_name: z.string().trim().max(160).nullable().optional(), dispatcher_phone: z.string().trim().max(40).nullable().optional(), dispatcher_email: z.string().trim().email().max(200).nullable().optional().or(z.literal("")), driver_name: z.string().trim().max(160).nullable().optional(), driver_phone: z.string().trim().max(40).nullable().optional(), truck_type_size: z.string().trim().max(120).nullable().optional(), truck_number: z.string().trim().max(40).nullable().optional(), trailer_number: z.string().trim().max(40).nullable().optional(), carrier_rate: z.number().nonnegative().nullable().optional(), pickup_facility: z.string().trim().max(160).nullable().optional(), pickup_address: z.string().trim().max(300).nullable().optional(), pickup_contact: z.string().trim().max(160).nullable().optional(), pickup_notes: z.string().trim().max(1000).nullable().optional(), pickup_po: z.string().trim().max(80).nullable().optional(), delivery_facility: z.string().trim().max(160).nullable().optional(), delivery_address: z.string().trim().max(300).nullable().optional(), delivery_contact: z.string().trim().max(160).nullable().optional(), delivery_notes: z.string().trim().max(1000).nullable().optional(), commodity_product: z.string().trim().max(160).nullable().optional(), commodity_weight: z.string().trim().max(60).nullable().optional(), commodity_pieces: z.string().trim().max(60).nullable().optional(), missed_pickup_reason: z.string().trim().max(1000).nullable().optional(), cancel_reason: z.string().trim().max(1000).nullable().optional() };
+const loadDetailSchema = { carrier_mc: z.string().trim().max(40).nullable().optional(), dispatcher_name: z.string().trim().max(160).nullable().optional(), dispatcher_phone: z.string().trim().max(40).nullable().optional(), dispatcher_email: z.string().trim().email().max(200).nullable().optional().or(z.literal("")), driver_name: z.string().trim().max(160).nullable().optional(), driver_phone: z.string().trim().max(40).nullable().optional(), truck_type_size: z.string().trim().max(120).nullable().optional(), truck_number: z.string().trim().max(40).nullable().optional(), trailer_number: z.string().trim().max(40).nullable().optional(), carrier_rate: z.number().nonnegative().nullable().optional(), pickup_facility: z.string().trim().max(160).nullable().optional(), pickup_address: z.string().trim().max(300).nullable().optional(), pickup_contact: z.string().trim().max(160).nullable().optional(), pickup_notes: z.string().trim().max(10000).nullable().optional(), pickup_po: z.string().trim().max(80).nullable().optional(), delivery_facility: z.string().trim().max(160).nullable().optional(), delivery_address: z.string().trim().max(300).nullable().optional(), delivery_contact: z.string().trim().max(160).nullable().optional(), delivery_notes: z.string().trim().max(10000).nullable().optional(), commodity_product: z.string().trim().max(160).nullable().optional(), commodity_weight: z.string().trim().max(60).nullable().optional(), commodity_pieces: z.string().trim().max(60).nullable().optional(), missed_pickup_reason: z.string().trim().max(1000).nullable().optional(), cancel_reason: z.string().trim().max(1000).nullable().optional() };
 const shipmentUpdateSchema = z.object({ ...loadDetailSchema, assigned_to: z.string().uuid().nullable().optional(), team_id: z.string().uuid().nullable().optional(), status: z.enum(["QUOTED", "BOOKED", "CARRIER_ASSIGNED", "MISSED_PICKUP", "PICKED_UP", "IN_TRANSIT", "DELIVERED", "PAID", "COMPLETED", "EXCEPTION", "CANCELLED"]).optional(), carrier_name: z.string().trim().max(160).nullable().optional(), exception_note: z.string().trim().max(3000).nullable().optional(), exception_owner_id: z.string().uuid().nullable().optional(), exception_resolution: z.string().trim().max(3000).nullable().optional(), invoice_ready: z.boolean().optional(), amount_quoted: z.number().nonnegative().nullable().optional(), amount_invoiced: z.number().nonnegative().nullable().optional(), amount_paid: z.number().nonnegative().nullable().optional(), payment_status: z.enum(["DRAFT", "SENT", "PENDING", "PAID", "OVERDUE", "CANCELLED"]).optional(), pickup_date: z.string().date().nullable().optional(), delivery_date: z.string().date().nullable().optional(), note: z.string().trim().max(3000).optional() });
 const salesShipmentStage = z.enum(["QUOTED", "BOOKED", "DELIVERED", "PAID", "CANCELLED"]);
 const customerUpdateSchema = z.object({ company_name: z.string().trim().min(2).max(180).optional(), contact_name: z.string().trim().max(160).nullable().optional(), contact_email: z.string().email().nullable().optional().or(z.literal("")), contact_phone: z.string().trim().max(80).nullable().optional() }).strict();
@@ -733,7 +733,11 @@ app.get("/api/v1/brokerage/customers", requireBrokerageUser, async (request: Bro
     }
     const { data, error } = await query;
     if (error) throw error;
-    response.json({ customers: data ?? [] });
+    // Client feedback: a qualified lead stays in Sales; it shows as a customer once it reaches Quoting.
+    const stageLeadIds = [...new Set((data ?? []).map((row: any) => row.lead_id).filter(Boolean))];
+    const { data: stages } = stageLeadIds.length ? await supabase.from("sales_leads").select("id, stage").in("id", stageLeadIds) : { data: [] as any[] };
+    const customerStage = new Set((stages ?? []).filter((row: any) => ["QUOTING", "CUSTOMER"].includes(row.stage)).map((row: any) => row.id));
+    response.json({ customers: (data ?? []).filter((row: any) => customerStage.has(row.lead_id)) });
   } catch (error) { next(error); }
 });
 
@@ -1503,10 +1507,27 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
       totals[label] = (totals[label] ?? 0) + 1;
       return totals;
     }, {});
+    // Customers in scope: onboarded in the period (first load added then) and currently shipping (a load under way).
+    let ownedQuery = supabase.from("brokerage_customers").select("id, owner_id, sales_leads(stage)").limit(2000);
+    if (!isSuper(actor)) {
+      if (!isSales(actor)) ownedQuery = ownedQuery.eq("id", "00000000-0000-0000-0000-000000000000");
+      else if (isManager(actor)) ownedQuery = ownedQuery.eq("sales_department_id", actor.department_id!);
+      else ownedQuery = ownedQuery.in("owner_id", scope.permissions.has("sales.reports.view_team") && scope.leadTeamIds.length ? [actor.id, ...scope.memberIds] : [actor.id]);
+    }
+    if (range.agent_id) ownedQuery = ownedQuery.eq("owner_id", range.agent_id);
+    const { data: owned } = await ownedQuery;
+    const ownedCustomers = (owned ?? []).filter((row: any) => ["QUOTING", "CUSTOMER"].includes((Array.isArray(row.sales_leads) ? row.sales_leads[0] : row.sales_leads)?.stage));
+    const ownedIds = ownedCustomers.map((row: any) => row.id);
+    const { data: ownedLoads } = ownedIds.length ? await supabase.from("brokerage_shipments").select("customer_id, created_at, status, sales_status").in("customer_id", ownedIds) : { data: [] as any[] };
+    const firstLoad = new Map<string, string>();
+    for (const load of ownedLoads ?? []) if (!firstLoad.has(load.customer_id) || load.created_at < firstLoad.get(load.customer_id)!) firstLoad.set(load.customer_id, load.created_at);
+    const inPeriod = (stamp: string) => (!range.from || stamp >= `${range.from}T00:00:00.000Z`) && (!range.to || stamp <= `${range.to}T23:59:59.999Z`);
+    const onboardedCustomers = [...firstLoad.values()].filter(inPeriod).length;
+    const shippingCustomers = new Set((ownedLoads ?? []).filter((load: any) => ["BOOKED", "PICKED_UP", "MISSED_PICKUP"].includes(load.status) && load.sales_status !== "CANCELLED").map((load: any) => load.customer_id)).size;
     response.json({
       range,
       sales: {
-        totals: { leads: leadRows.length, customers: salesCustomers?.length ?? 0, shipments: salesShipmentRows.length, pipeline_value: sum(leadRows, "estimated_monthly_value"), quoted_value: sum(salesShipmentRows, "amount_quoted"), agreed_value: sum(salesShipmentRows, "amount_agreed"), gross_generated: commercialValue(salesShipmentRows.filter((shipment) => ["BOOKED", "DELIVERED", "PAID"].includes(shipment.sales_status))) },
+        totals: { leads: leadRows.length, customers: salesCustomers?.length ?? 0, onboarded_customers: onboardedCustomers, shipping_customers: shippingCustomers, shipments: salesShipmentRows.length, pipeline_value: sum(leadRows, "estimated_monthly_value"), quoted_value: sum(salesShipmentRows, "amount_quoted"), agreed_value: sum(salesShipmentRows, "amount_agreed"), gross_generated: commercialValue(salesShipmentRows.filter((shipment) => ["BOOKED", "DELIVERED", "PAID"].includes(shipment.sales_status))) },
         lead_stages: tally(leadRows, "stage"),
         quote_stages: tally(quoteRows, "stage"),
         shipment_statuses: tally(salesShipmentRows, "sales_status"),

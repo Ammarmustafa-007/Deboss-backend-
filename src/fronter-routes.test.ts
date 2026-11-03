@@ -55,13 +55,13 @@ test("a Fronter with no linked Sales agent is told to ask the Super Admin", asyn
   assert.equal(tables.fronter_prospects[1].status, "CONTACTED");
 });
 
-test("a Sales agent sees only their own Fronters' rows, read-only except the status", async () => {
+test("a Sales agent sees and edits only their own Fronters' rows", async () => {
   const mine = await call(agent.id, "/api/v1/fronter/prospects");
   assert.equal(mine.status, 200);
   assert.deepEqual(mine.body.prospects.map((row: any) => row.company_name).sort(), ["For Sales", "Linked"]);
-  assert.ok(mine.body.prospects.every((row: any) => row.fields_locked));
+  assert.ok(mine.body.prospects.every((row: any) => !row.fields_locked));
   assert.deepEqual((await call(otherAgent.id, "/api/v1/fronter/prospects")).body.prospects, []);
-  assert.equal((await call(agent.id, `/api/v1/fronter/prospects/${id(32)}`, "PATCH", { commodity: "Steel" })).status, 403);
+  assert.equal((await call(agent.id, `/api/v1/fronter/prospects/${id(32)}`, "PATCH", { commodity: "Steel" })).status, 200);
   assert.equal((await call(otherAgent.id, `/api/v1/fronter/prospects/${id(32)}`, "PATCH", { status: "CONTACTED" })).status, 403);
   assert.equal((await call(agent.id, `/api/v1/fronter/prospects/${id(32)}`, "PATCH", { status: "CONTACTED" })).status, 200);
 });

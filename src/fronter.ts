@@ -55,7 +55,7 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
     return response.status(403).json({ error: "This area is for the Fronters department." });
   }
   const guard = [requireUser, fronterOnly] as Handler[];
-  // Brokerage Sales also open the mining sheet of the Fronters who work for them (agents: their own; managers: their department's).
+  // Brokerage Sales also open and edit the mining sheet of the Fronters who work for them (agents: their own; managers: their department's).
   const isSales = (actor: Actor) => actor.department?.business_unit === "BROKERAGE" && actor.department?.function === "SALES";
   function fronterOrSales(request: Req, response: Response, next: NextFunction) {
     const actor = request.actor!;
@@ -109,7 +109,7 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
       const leadIds = rows.map((row: any) => row.lead_id).filter(Boolean);
       const { data: leads } = leadIds.length ? await supabase.from("sales_leads").select("id, stage").in("id", leadIds) : { data: [] as any[] };
       const stageOf = new Map((leads ?? []).map((row: any) => [row.id, row.stage]));
-      response.json({ prospects: rows.map((row: any) => ({ ...row, created_by_name: people.get(row.created_by) ?? null, assigned_name: row.assigned_to ? people.get(row.assigned_to) ?? null : null, lead_stage: row.lead_id ? stageOf.get(row.lead_id) ?? null : null, editable: sales ? row.status !== "QUALIFIED" : canEdit(actor, scope, row), fields_locked: sales })) });
+      response.json({ prospects: rows.map((row: any) => ({ ...row, created_by_name: people.get(row.created_by) ?? null, assigned_name: row.assigned_to ? people.get(row.assigned_to) ?? null : null, lead_stage: row.lead_id ? stageOf.get(row.lead_id) ?? null : null, editable: sales ? row.status !== "QUALIFIED" : canEdit(actor, scope, row), fields_locked: false })) });
     } catch (error) { next(error); }
   });
 
@@ -142,7 +142,6 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
       const sales = isSales(actor);
       if (sales) {
         if (!(await linkedFronters(supabase, actor)).includes(row.created_by)) return response.status(403).json({ error: "This prospect belongs to a Fronter who doesn't work for you." });
-        if (Object.keys(input).some((key) => key !== "status")) return response.status(403).json({ error: "Sales can change the status only. The Fronter fills in the details." });
       } else if (!canEdit(actor, scope, row)) return response.status(403).json({ error: "You can't edit this prospect." });
       const { status, assigned_to, ...fields } = input;
       if (assigned_to) { const agents = await salesAgents(supabase); if (!agents.some((agent) => agent.id === assigned_to)) return response.status(422).json({ error: "Assign to an active Brokerage Sales agent." }); }
