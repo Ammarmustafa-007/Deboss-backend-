@@ -239,16 +239,17 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
     try {
       const actor = request.actor!; const supabase = adminClient(); const scope = await teamScope(actor);
       const departmentId = actor.department_id;
-      let users: any[] = []; let teams: any[] = [];
+      let users: any[] = []; let teams: any[] = []; let managers: any[] = [];
       if (departmentId && (isManager(actor) || scope.leadTeamIds.length)) {
         let userQuery = supabase.from("profiles").select("id, full_name, email, role").eq("department_id", departmentId).eq("is_active", true).eq("role", "AGENT").order("full_name");
         let teamQuery = supabase.from("teams").select("id, name, team_lead_id").eq("department_id", departmentId).eq("is_active", true).order("name");
         if (!isManager(actor)) { userQuery = userQuery.in("id", scope.memberIds.length ? scope.memberIds : [actor.id]); teamQuery = teamQuery.in("id", scope.leadTeamIds); }
-        const [{ data: people }, { data: teamRows }] = await Promise.all([userQuery, teamQuery]);
-        users = people ?? []; teams = teamRows ?? [];
+        const [{ data: people }, { data: teamRows }, { data: managerRows }] = await Promise.all([userQuery, teamQuery,
+          supabase.from("profiles").select("id, full_name, email, role").eq("department_id", departmentId).eq("is_active", true).eq("role", "MANAGER").order("full_name")]);
+        users = people ?? []; teams = teamRows ?? []; managers = managerRows ?? [];
       }
       const { data: operations } = await supabase.from("departments").select("id, name").eq("business_unit", "DISPATCH").eq("function", "OPERATIONS").eq("is_active", true).order("name");
-      response.json({ users, teams, operations_departments: operations ?? [] });
+      response.json({ users, teams, managers, operations_departments: operations ?? [] });
     } catch (error) { next(error); }
   });
 
@@ -355,7 +356,11 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       if (carrier.review_status === "DISCARDED" && profileChange) return response.status(422).json({ error: "A discarded carrier cannot be edited." });
       if (owner_id !== undefined || team_id !== undefined) {
         if (!carrierAssign(actor, scope, carrier)) return response.status(403).json({ error: "Carrier assignment permission is required." });
-        if (owner_id && !await departmentPeople(supabase, carrier.department_id, [owner_id])) return response.status(422).json({ error: "The owner must be an active agent in this Dispatch Sales department." });
+        // A carrier can be owned by an agent or a manager of its Dispatch Sales department (managers add carriers too).
+        if (owner_id && !await departmentPeople(supabase, carrier.department_id, [owner_id])) {
+          const { data: manager } = await supabase.from("profiles").select("id").eq("id", owner_id).eq("department_id", carrier.department_id).eq("role", "MANAGER").eq("is_active", true).maybeSingle();
+          if (!manager) return response.status(422).json({ error: "The owner must be an active agent or manager in this Dispatch Sales department." });
+        }
         if (!isSuper(actor) && !isManager(actor)) {
           if (owner_id && !scope.memberIds.includes(owner_id)) return response.status(403).json({ error: "You can assign carriers only to members of your team." });
           if (team_id !== undefined && (!team_id || !scope.leadTeamIds.includes(team_id))) return response.status(403).json({ error: "You can move carriers only between your own teams." });
