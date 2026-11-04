@@ -161,6 +161,32 @@ async function salesManagersOf(supabase: ReturnType<typeof adminClient>, departm
   const { data } = await supabase.from("profiles").select("id").eq("department_id", departmentId).eq("role", "MANAGER").eq("is_active", true);
   return (data ?? []).map((row: any) => row.id as string);
 }
+/**
+ * Super Admin switch (brokerage_settings). Off = the company has no Brokerage Sales Manager: the agent hands a new
+ * customer's first load straight to the Operations Manager, and an Operations rejection goes straight back to the agent.
+ * On by default, and also while the table doesn't exist yet, so nothing changes until the Super Admin turns it off.
+ */
+async function salesManagerApproval(supabase: ReturnType<typeof adminClient>) {
+  const { data, error } = await supabase.from("brokerage_settings").select("sales_manager_approval").eq("id", true).maybeSingle();
+  return error || !data ? true : (data as any).sales_manager_approval !== false;
+}
+/** The Operations department a new customer's first load goes to: the one chosen, else the customer's, else the only active one. */
+async function operationsDepartmentFor(supabase: ReturnType<typeof adminClient>, chosen: string | null | undefined, customer: any): Promise<{ id?: string; error?: string }> {
+  const { data } = await supabase.from("departments").select("id").eq("business_unit", "BROKERAGE").eq("function", "OPERATIONS").eq("is_active", true);
+  const active = (data ?? []).map((row: any) => row.id as string);
+  const candidate = chosen ?? customer?.operations_department_id ?? null;
+  if (candidate) return active.includes(candidate) ? { id: candidate } : { error: "Choose an active Brokerage Operations department." };
+  if (active.length === 1) return { id: active[0] };
+  return { error: active.length ? "Choose the Operations department for this customer." : "There is no active Brokerage Operations department yet." };
+}
+/** A new customer's first load goes to the Operations Manager of `departmentId`, who approves it (assigning the customer's agent) or rejects it. */
+async function sendToOperationsReview(supabase: ReturnType<typeof adminClient>, load: any, customer: any, departmentId: string, actorId: string, post: string, body: string) {
+  await supabase.from("brokerage_customers").update({ operations_department_id: departmentId }).eq("id", customer.id);
+  await supabase.from("brokerage_shipments").update({ operations_department_id: departmentId, ops_review: "PENDING", status: "QUOTED", assigned_to: null }).eq("id", load.id);
+  const { data: opsManagers } = await supabase.from("profiles").select("id").eq("department_id", departmentId).eq("role", "MANAGER").eq("is_active", true);
+  await postEvent(supabase as any, "QUOTES", actorId, post);
+  if (opsManagers?.length) await supabase.from("notifications").insert(opsManagers.map((manager: any) => ({ recipient_id: manager.id, kind: "QUOTE_HANDED_OFF", title: `Review a new customer: ${customer.company_name}`, body, entity_type: "SHIPMENT", entity_id: load.id })));
+}
 /** The quote goes to the Sales Manager for review (the first load of a customer). */
 async function submitForReview(supabase: ReturnType<typeof adminClient>, quote: { id: string }, departmentId: string, actorId: string, automatic: boolean, load?: any) {
   if (load) await postEvent(supabase as any, "QUOTES", actorId, `💰 Rate locked: ${load.customer_name ?? "a new customer"} · ${laneOf(load)} · ${usd(load.amount_agreed)}. Waiting for the Sales Manager.`);
@@ -192,6 +218,8 @@ async function routeLockedRate(supabase: ReturnType<typeof adminClient>, shipmen
     const { data: agent } = await supabase.from("profiles").select("id").eq("id", customer.operations_agent_id).eq("is_active", true).maybeSingle();
     if (agent) return handToCustomerAgent(supabase, shipment, customer, actorId);
   }
+  // No Sales Manager: the load waits for the agent's "Hand off to Operations".
+  if (!await salesManagerApproval(supabase)) return;
   return submitForReview(supabase, quote, customer.sales_department_id, actorId, true, shipment);
 }
 
@@ -318,6 +346,47 @@ async function validDepartmentPeople(departmentId: string, ids: string[]) {
 }
 
 app.get("/health", (_request, response) => response.json({ status: "ok", service: "deboss-api", timestamp: new Date().toISOString() }));
+
+/** Super Admin: the Brokerage Sales Manager switch. Turning it off moves loads waiting for the Sales Manager on. */
+app.get("/api/v1/admin/brokerage-settings", requireSuperAdmin, async (_request, response, next) => {
+  try { response.json({ sales_manager_approval: await salesManagerApproval(adminClient()) }); } catch (error) { next(error); }
+});
+app.put("/api/v1/admin/brokerage-settings", requireSuperAdmin, async (request: AuthenticatedRequest, response, next) => {
+  try {
+    const { sales_manager_approval } = z.object({ sales_manager_approval: z.boolean() }).parse(request.body);
+    const supabase = adminClient(); const actorId = request.actor!.id;
+    const before = await salesManagerApproval(supabase);
+    const { error } = await supabase.from("brokerage_settings").upsert({ id: true, sales_manager_approval, updated_by: actorId, updated_at: new Date().toISOString() });
+    if (error) return response.status(503).json({ error: "Run migration 20261105_029_brokerage_settings.sql in Supabase first." });
+    const moved = { to_operations: 0, to_agent: 0 };
+    if (before && !sales_manager_approval) {
+      // Nothing may wait for a Sales Manager who isn't there: first loads go on to Operations (or back to the
+      // agent to hand off when the department can't be chosen for them), and Operations rejections go to the agent.
+      const { data: waiting } = await supabase.from("sales_quotes").select("id, created_by").in("stage", ["SUBMITTED", "OPS_REJECTED"]);
+      for (const quote of waiting ?? []) {
+        const { data: full } = await supabase.from("sales_quotes").select("stage, ops_rejection_note").eq("id", quote.id).single();
+        const { data: load } = await supabase.from("brokerage_shipments").select("*").eq("quote_id", quote.id).maybeSingle();
+        if (!load || load.status === "CANCELLED" || load.sales_status === "CANCELLED") continue;
+        const { data: customer } = load.customer_id ? await supabase.from("brokerage_customers").select("*").eq("id", load.customer_id).maybeSingle() : { data: null as any };
+        const department = (full as any)?.stage === "SUBMITTED" && customer && load.amount_agreed && !customer.operations_agent_id ? await operationsDepartmentFor(supabase, null, customer) : {} as { id?: string };
+        if (department.id) {
+          await supabase.from("sales_quotes").update({ stage: "OPS_REVIEW", reviewed_by: actorId, reviewed_at: new Date().toISOString(), rejection_note: null }).eq("id", quote.id);
+          await supabase.from("quote_events").insert({ quote_id: quote.id, actor_id: actorId, event_type: "QUOTE_SENT_TO_OPERATIONS", body: "Sent on to Operations: the Sales Manager step was turned off." });
+          await sendToOperationsReview(supabase, load, customer, department.id, actorId, `📤 ${load.reference_number} for ${customer.company_name} went on to Operations. Waiting for the Operations Manager.`, `${load.reference_number} is ready for your review. Approve it and assign an Operations agent, or reject it with a reason.`);
+          moved.to_operations += 1;
+        } else {
+          const note = (full as any)?.stage === "OPS_REJECTED" ? `Operations: ${(full as any).ops_rejection_note ?? "rejected"}` : null;
+          await supabase.from("sales_quotes").update({ stage: (full as any)?.stage === "OPS_REJECTED" ? "REJECTED" : "DRAFT", rejection_note: note }).eq("id", quote.id);
+          await supabase.from("brokerage_shipments").update({ ops_review: null }).eq("id", load.id);
+          if (quote.created_by) await supabase.from("notifications").insert({ recipient_id: quote.created_by, kind: "QUOTE_REWORK", title: `Hand off ${load.reference_number} to Operations`, body: note ? `Fix it and hand it off again. ${note}`.slice(0, 200) : "Open the load and use Hand off to Operations.", entity_type: "QUOTE", entity_id: quote.id });
+          moved.to_agent += 1;
+        }
+      }
+    }
+    await writeAudit(supabase, actorId, "BROKERAGE_SETTINGS_UPDATED", "brokerage_settings", actorId, { before: { sales_manager_approval: before }, after: { sales_manager_approval }, moved });
+    response.json({ sales_manager_approval, moved });
+  } catch (error) { next(error); }
+});
 
 app.get("/api/v1/users", requireSuperAdmin, async (_request, response, next) => {
   try {
@@ -460,7 +529,7 @@ app.get("/api/v1/brokerage/workspace", requireBrokerageUser, async (request: Bro
     }
     const [{ data: shipments }, { data: quotes }] = await Promise.all([shipmentQuery, sales && leadIds.length ? supabase.from("sales_quotes").select("*").in("lead_id", leadIds).order("updated_at", { ascending: false }) : Promise.resolve({ data: [] })]);
     const operationsAgent = isOperations(actor);
-    response.json({ role: actor.role, department: actor.department, teams, operationsDepartments, permissions: [...permissions], capabilities: { sales, departmentManager, teamLead: leadTeams.length > 0, canCreateLead: sales, canCreateQuote: sales, canManageCustomerShipments: sales, canUpdateShipments: operationsAgent, canRecordShipmentFinance: operationsAgent, canRaiseException: operationsAgent, canAssignLeads: departmentManager || permissions.has("sales.leads.assign"), canReviewQuotes: departmentManager || permissions.has("sales.quotes.review"), canHandoffQuotes: departmentManager || permissions.has("sales.quotes.handoff"), canAssignShipments: departmentManager || permissions.has("operations.shipments.assign"), canReviewDocuments: departmentManager || permissions.has("operations.documents.review"), canResolveExceptions: departmentManager || permissions.has("operations.exceptions.resolve"), canMarkInvoiceReady: departmentManager || permissions.has("operations.billing.mark_invoice_ready") }, leads, quotes, shipments: (shipments ?? []).map((row: any) => ({ ...(sales ? withoutCarrier(row) : row), ...profitOf(row) })) });
+    response.json({ role: actor.role, department: actor.department, teams, operationsDepartments, permissions: [...permissions], capabilities: { sales, salesManagerApproval: await salesManagerApproval(supabase), departmentManager, teamLead: leadTeams.length > 0, canCreateLead: sales, canCreateQuote: sales, canManageCustomerShipments: sales, canUpdateShipments: operationsAgent, canRecordShipmentFinance: operationsAgent, canRaiseException: operationsAgent, canAssignLeads: departmentManager || permissions.has("sales.leads.assign"), canReviewQuotes: departmentManager || permissions.has("sales.quotes.review"), canHandoffQuotes: departmentManager || permissions.has("sales.quotes.handoff"), canAssignShipments: departmentManager || permissions.has("operations.shipments.assign"), canReviewDocuments: departmentManager || permissions.has("operations.documents.review"), canResolveExceptions: departmentManager || permissions.has("operations.exceptions.resolve"), canMarkInvoiceReady: departmentManager || permissions.has("operations.billing.mark_invoice_ready") }, leads, quotes, shipments: (shipments ?? []).map((row: any) => ({ ...(sales ? withoutCarrier(row) : row), ...profitOf(row) })) });
   } catch (error) { next(error); }
 });
 
@@ -685,7 +754,7 @@ app.get("/api/v1/brokerage/customers/:id/profile", requireBrokerageUser, async (
     const scope = await teamScope(actor); const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("id, owner_id, team_id, department_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
     const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id) || customer.owner_id === actor.id || (lead && inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.view_team"));
     if (!allowed) return response.status(403).json({ error: "Customer is outside your work scope." });
-    const [activities, comments, quotes, shipments] = await Promise.all([customer.lead_id ? supabase.from("lead_activities").select("*").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("record_comments").select("*").eq("entity_type", "CUSTOMER").eq("entity_id", customer.id).order("created_at", { ascending: false }), customer.lead_id ? supabase.from("sales_quotes").select("id, pickup_location, delivery_location, stage, quoted_rate, created_at").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("brokerage_shipments").select("id, quote_id, reference_number, status, sales_status, operations_department_id, pickup_location, delivery_location, equipment_type, amount_quoted, amount_agreed, carrier_rate, miles, load_notes, pickup_date, delivery_date, pickup_facility, pickup_address, pickup_contact, pickup_notes, pickup_po, delivery_facility, delivery_address, delivery_contact, delivery_notes, commodity_product, commodity_weight, commodity_pieces, missed_pickup_reason, cancel_reason, cancelled_at, created_at, updated_at, assigned:profiles!brokerage_shipments_assigned_to_fkey(full_name), brokerage_invoices(invoice_number, status)").eq("customer_id", customer.id).order("created_at", { ascending: false })]);
+    const [activities, comments, quotes, shipments] = await Promise.all([customer.lead_id ? supabase.from("lead_activities").select("*").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("record_comments").select("*").eq("entity_type", "CUSTOMER").eq("entity_id", customer.id).order("created_at", { ascending: false }), customer.lead_id ? supabase.from("sales_quotes").select("id, pickup_location, delivery_location, stage, quoted_rate, rejection_note, created_at").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("brokerage_shipments").select("id, quote_id, reference_number, status, sales_status, operations_department_id, pickup_location, delivery_location, equipment_type, amount_quoted, amount_agreed, carrier_rate, miles, load_notes, pickup_date, delivery_date, pickup_facility, pickup_address, pickup_contact, pickup_notes, pickup_po, delivery_facility, delivery_address, delivery_contact, delivery_notes, commodity_product, commodity_weight, commodity_pieces, missed_pickup_reason, cancel_reason, cancelled_at, created_at, updated_at, assigned:profiles!brokerage_shipments_assigned_to_fkey(full_name), brokerage_invoices(invoice_number, status)").eq("customer_id", customer.id).order("created_at", { ascending: false })]);
     const canManage = isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id);
     // Documents Operations uploaded on this customer's loads, minus rate confirmations (they name the carrier).
     const loadIds = (shipments.data ?? []).map((row: any) => row.id);
@@ -881,6 +950,32 @@ app.post("/api/v1/brokerage/quotes/:id/submit", requireBrokerageUser, async (req
     const allowed = lead && (isSuper(actor) || (isManager(actor) && actor.department_id === lead.department_id) || lead.owner_id === actor.id || (inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.edit_team")));
     if (!allowed) return response.status(403).json({ error: "Quote submission permission is required." });
     if (!['DRAFT', 'REJECTED'].includes((quote as any).stage)) return response.status(422).json({ error: "Only a draft or reworked quote can be submitted." });
+    if (!await salesManagerApproval(supabase)) {
+      // No Sales Manager: the agent hands the load to Operations themselves.
+      const { operations_department_id } = z.object({ operations_department_id: z.string().uuid().optional() }).parse(request.body ?? {});
+      const { data: load } = await supabase.from("brokerage_shipments").select("*").eq("quote_id", quote.id).maybeSingle();
+      if (!load?.amount_agreed) return response.status(422).json({ error: "Enter the agreed rate before handing this load to Operations." });
+      const { data: customer } = load.customer_id ? await supabase.from("brokerage_customers").select("*").eq("id", load.customer_id).maybeSingle() : { data: null as any };
+      if (!customer) return response.status(422).json({ error: "This load isn't linked to a customer." });
+      if (customer.operations_agent_id && customer.operations_department_id) {
+        const { data: agent } = await supabase.from("profiles").select("id").eq("id", customer.operations_agent_id).eq("is_active", true).maybeSingle();
+        if (agent) {
+          await handToCustomerAgent(supabase, load, customer, actor.id);
+          await writeAudit(supabase, actor.id, "QUOTE_HANDED_OFF", "quote", quote.id, { shipment_id: load.id, operations_agent_id: customer.operations_agent_id });
+          const { data: handed } = await supabase.from("sales_quotes").select("*").eq("id", quote.id).single();
+          return response.json({ quote: handed, routed: "AGENT" });
+        }
+      }
+      const department = await operationsDepartmentFor(supabase, operations_department_id, customer);
+      if (!department.id) return response.status(422).json({ error: department.error });
+      // reviewed_at marks when the load was committed; payroll credits it once Operations approves (HANDED_OFF).
+      const { data: handedOff, error: handOffError } = await supabase.from("sales_quotes").update({ stage: "OPS_REVIEW", reviewed_by: actor.id, reviewed_at: new Date().toISOString(), rejection_note: null }).eq("id", quote.id).select().single();
+      if (handOffError || !handedOff) throw handOffError;
+      await supabase.from("quote_events").insert({ quote_id: quote.id, actor_id: actor.id, event_type: "QUOTE_SENT_TO_OPERATIONS", body: "Handed to Operations by the agent." });
+      await sendToOperationsReview(supabase, load, customer, department.id, actor.id, `📤 ${load.reference_number} for ${customer.company_name} (${laneOf(load)}, ${usd(load.amount_agreed)}) handed to Operations. Waiting for the Operations Manager.`, `${load.reference_number} was handed off by Sales. Approve it and assign an Operations agent, or reject it with a reason.`);
+      await writeAudit(supabase, actor.id, "QUOTE_SENT_TO_OPERATIONS", "quote", quote.id, { shipment_id: load.id, operations_department_id: department.id });
+      return response.json({ quote: handedOff, routed: "OPERATIONS" });
+    }
     const { data, error: updateError } = await supabase.from("sales_quotes").update({ stage: "SUBMITTED", rejection_note: null }).eq("id", quote.id).select().single();
     if (updateError || !data) throw updateError;
     await supabase.from("quote_events").insert({ quote_id: quote.id, actor_id: actor.id, event_type: "QUOTE_SUBMITTED" });
@@ -997,11 +1092,7 @@ app.post("/api/v1/brokerage/quotes/:id/review", requireBrokerageUser, async (req
     }
     const { data, error } = await supabase.from("sales_quotes").update({ stage, reviewed_by: actor.id, reviewed_at: new Date().toISOString(), rejection_note: input.action === "REJECT" ? (input.note ?? "Rework requested") : null }).eq("id", quote.id).select().single(); if (error) throw error;
     if (stage === "OPS_REVIEW") {
-      await supabase.from("brokerage_customers").update({ operations_department_id: operationsDepartmentId }).eq("id", customer.id);
-      await supabase.from("brokerage_shipments").update({ operations_department_id: operationsDepartmentId, ops_review: "PENDING", status: "QUOTED", assigned_to: null }).eq("id", load!.id);
-      const { data: opsManagers } = await supabase.from("profiles").select("id").eq("department_id", operationsDepartmentId!).eq("role", "MANAGER").eq("is_active", true);
-      await postEvent(supabase as any, "QUOTES", actor.id, `✅ Sales approved ${load!.reference_number} for ${customer.company_name} (${laneOf(load)}, ${usd(load!.amount_agreed)}). Waiting for the Operations Manager.`);
-      if (opsManagers?.length) await supabase.from("notifications").insert(opsManagers.map((manager: any) => ({ recipient_id: manager.id, kind: "QUOTE_HANDED_OFF", title: `Review a new customer: ${customer.company_name}`, body: `${load!.reference_number} is approved by Sales. Approve it and assign an Operations agent, or reject it with a reason.`, entity_type: "SHIPMENT", entity_id: load!.id })));
+      await sendToOperationsReview(supabase, load, customer, operationsDepartmentId!, actor.id, `✅ Sales approved ${load!.reference_number} for ${customer.company_name} (${laneOf(load)}, ${usd(load!.amount_agreed)}). Waiting for the Operations Manager.`, `${load!.reference_number} is approved by Sales. Approve it and assign an Operations agent, or reject it with a reason.`);
     } else if (input.action === "APPROVE" && load && customer?.operations_agent_id && !load.operations_department_id) {
       await handToCustomerAgent(supabase, load, customer, actor.id);
     } await supabase.from("quote_events").insert({ quote_id: quote.id, actor_id: actor.id, event_type: `QUOTE_${stage}`, body: input.note ?? null }); if ((quote as any).created_by) await supabase.from("notifications").insert({ recipient_id: (quote as any).created_by, kind: input.action === "REJECT" ? "QUOTE_REWORK" : "QUOTE_APPROVED", title: input.action === "REJECT" ? "Quote returned for rework" : "Quote approved", body: input.action === "REJECT" ? (input.note ?? "A reviewer requested changes.") : stage === "OPS_REVIEW" ? "Approved by the Sales Manager. It's now with the Operations Manager." : "Your quote is approved.", entity_type: "QUOTE", entity_id: quote.id }); await writeAudit(supabase, actor.id, `QUOTE_${stage}`, "quote", quote.id, { note: input.note ?? null }); response.json({ quote: data });
@@ -1061,12 +1152,19 @@ app.post("/api/v1/brokerage/shipments/:id/ops-review", requireBrokerageUser, asy
       await writeAudit(supabase, actor.id, "OPS_REVIEW_APPROVED", "shipment", shipment.id, { agent_id: input.agent_id, customer_id: customer?.id ?? null });
       return response.json({ shipment: { ...data, ...profitOf(data) } });
     }
-    // Rejected: it leaves Operations and goes back to the Sales Manager with the reason.
-    const { data, error } = await supabase.from("brokerage_shipments").update({ ops_review: "REJECTED", operations_department_id: null, assigned_to: null, status: "QUOTED" }).eq("id", shipment.id).select().single(); if (error) throw error;
-    if (shipment.quote_id) { await supabase.from("sales_quotes").update({ stage: "OPS_REJECTED", ops_reviewed_by: actor.id, ops_reviewed_at: now, ops_rejection_note: input.note }).eq("id", shipment.quote_id); await supabase.from("quote_events").insert({ quote_id: shipment.quote_id, actor_id: actor.id, event_type: "QUOTE_OPS_REJECTED", body: input.note }); }
+    // Rejected: it leaves Operations and goes back to the Sales Manager with the reason, or, with no Sales Manager
+    // (Super Admin switch), straight back to the agent to fix and hand off again (or cancel).
+    const salesReview = await salesManagerApproval(supabase);
+    const { data, error } = await supabase.from("brokerage_shipments").update({ ops_review: salesReview ? "REJECTED" : null, operations_department_id: null, assigned_to: null, status: "QUOTED" }).eq("id", shipment.id).select().single(); if (error) throw error;
+    if (shipment.quote_id) { await supabase.from("sales_quotes").update({ stage: salesReview ? "OPS_REJECTED" : "REJECTED", ...(salesReview ? {} : { rejection_note: `Operations: ${input.note}` }), ops_reviewed_by: actor.id, ops_reviewed_at: now, ops_rejection_note: input.note }).eq("id", shipment.quote_id); await supabase.from("quote_events").insert({ quote_id: shipment.quote_id, actor_id: actor.id, event_type: "QUOTE_OPS_REJECTED", body: input.note }); }
     await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "OPS_REJECTED", body: input.note });
-    const reviewers = await salesManagersOf(supabase, shipment.sales_department_id);
-    if (reviewers.length) await supabase.from("notifications").insert(reviewers.map((recipient_id) => ({ recipient_id, kind: "QUOTE_REWORK", title: `Rejected by Operations: ${shipment.reference_number}`, body: input.note!.slice(0, 160), entity_type: "QUOTE", entity_id: shipment.quote_id })));
+    if (salesReview) {
+      const reviewers = await salesManagersOf(supabase, shipment.sales_department_id);
+      if (reviewers.length) await supabase.from("notifications").insert(reviewers.map((recipient_id) => ({ recipient_id, kind: "QUOTE_REWORK", title: `Rejected by Operations: ${shipment.reference_number}`, body: input.note!.slice(0, 160), entity_type: "QUOTE", entity_id: shipment.quote_id })));
+    } else {
+      const { data: rejected } = shipment.quote_id ? await supabase.from("sales_quotes").select("created_by").eq("id", shipment.quote_id).maybeSingle() : { data: null };
+      if ((rejected as any)?.created_by) await supabase.from("notifications").insert({ recipient_id: (rejected as any).created_by, kind: "QUOTE_REWORK", title: `Rejected by Operations: ${shipment.reference_number}`, body: `Fix it and hand it off again, or cancel the load. Operations: ${input.note}`.slice(0, 200), entity_type: "QUOTE", entity_id: shipment.quote_id });
+    }
     await postEvent(supabase as any, "QUOTES", actor.id, `⛔ Operations rejected ${shipment.reference_number} (${customer?.company_name ?? "new customer"}): ${input.note}`);
     await writeAudit(supabase, actor.id, "OPS_REVIEW_REJECTED", "shipment", shipment.id, { note: input.note });
     response.json({ shipment: data });

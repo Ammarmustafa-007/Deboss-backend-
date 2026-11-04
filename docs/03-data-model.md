@@ -32,6 +32,7 @@ All data lives in Supabase Postgres, schema `public`. The schema is built **only
 | 026 | `dispatch_invoice_loads` | `dispatch_loads.invoice_id`; several invoices per truck and week |
 | 027 | `fronter_sales_agent` | `profiles.sales_agent_id` |
 | 028 | `delete_unused_user` | `delete_unused_user(uuid)` function |
+| 029 | `brokerage_settings` | `brokerage_settings` (one row): the Brokerage Sales Manager switch |
 
 ## 3.2 Enums
 
@@ -768,6 +769,17 @@ Created in `20261027_016_chat_and_fronters.sql`.
 | `best_states` | text |
 | `notes` | text |
 | `created_at` | timestamptz not null default now() |
+| `updated_at` | timestamptz not null default now() |
+
+### `brokerage_settings`
+
+Created in `20261105_029_brokerage_settings.sql`. One row, read and written only by the API.
+
+| Column | Definition |
+|---|---|
+| `id` | boolean primary key default true check (id) |
+| `sales_manager_approval` | boolean not null default true: whether a new customer's first load needs the Sales Manager (see [05-brokerage.md](05-brokerage.md#without-a-brokerage-sales-manager-super-admin-switch)) |
+| `updated_by` | uuid references public.profiles(id) on delete set null |
 | `updated_at` | timestamptz not null default now() |
 
 ### `hr_settings`

@@ -37,7 +37,7 @@ Base URL: the backend origin (for example `http://localhost:4000`). Every endpoi
 | GET | `/api/v1/brokerage/notifications` | Any active user | The caller's notifications (bell). |  |
 | PATCH | `/api/v1/brokerage/notifications/:id/read` | Any active user | Mark a notification read. | 404:Notification not found. |
 | PATCH | `/api/v1/brokerage/quotes/:id` | Any active user | Edit a quote while it is a draft or returned for rework. | 404:Quote not found. // 403:This quote cannot be edited in its current stage. |
-| POST | `/api/v1/brokerage/quotes/:id/submit` | Any active user | Send a quote to the Sales Manager for review. | 404:Quote not found. // 422:This load was cancelled, so its quote can't move forward. // 403:Quote submission permission is required. // 422:Only a draft or reworked quote can be submitted. |
+| POST | `/api/v1/brokerage/quotes/:id/submit` | Any active user | Send a quote to the Sales Manager for review. With the Sales Manager step off: hand the load to Operations (body: optional `operations_department_id`); returns `routed: "OPERATIONS"` or `"AGENT"`. | 404:Quote not found. // 422:This load was cancelled, so its quote can't move forward. // 403:Quote submission permission is required. // 422:Only a draft or reworked quote can be submitted. // 422:Enter the agreed rate before handing this load to Operations. // 422:Choose the Operations department for this customer. |
 | GET | `/api/v1/brokerage/quotes/:id/detail` | Any active user | A quote with events, attachments and comments. | 404:Quote not found. // 403:Quote is outside your work scope. |
 | POST | `/api/v1/brokerage/quotes/:id/upload-url` | Any active user | Signed upload URL for a quote attachment (PDF, JPG, PNG, max 10 MB). | 404:Quote not found. // 403:Quote update permission is required. // 422:Only PDF, JPG, JPEG, and PNG files are allowed. |
 | POST | `/api/v1/brokerage/quotes/:id/attachments` | Any active user | Record an uploaded quote attachment. | 403:Quote update permission is required. |
@@ -136,6 +136,8 @@ Base URL: the backend origin (for example `http://localhost:4000`). Every endpoi
 
 | Method | Path | Access | Purpose | Rules |
 |---|---|---|---|---|
+| GET | `/api/v1/admin/brokerage-settings` | Super Admin | `{ sales_manager_approval }` (true when the table doesn't exist yet). |  |
+| PUT | `/api/v1/admin/brokerage-settings` | Super Admin | Turn the Brokerage Sales Manager step on or off; turning it off moves waiting loads on (`moved`). | 503:Run migration 20261105_029_brokerage_settings.sql in Supabase first. |
 | GET | `/api/v1/admin/hr/rules` | Super Admin | The commission rules (amounts, rates, targets, shares). |  |
 | PUT | `/api/v1/admin/hr/rules` | Super Admin | Replace the commission rules. Logged with before and after. |  |
 | GET | `/api/v1/admin/hr/employees` | Super Admin | Every agent and manager with base salary (PKR), joining date, manager, exit. |  |

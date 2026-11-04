@@ -57,6 +57,27 @@ The Operations Manager can change a customer's agent at any time (`PATCH /custom
 
 `sales_quotes.reviewed_at` records when a load was committed.
 
+### Without a Brokerage Sales Manager (Super Admin switch)
+
+`brokerage_settings.sales_manager_approval` (migration 029, Super Admin → Settings → "Brokerage Sales Manager"). **On** (default, and also while the table doesn't exist) is the flow above. **Off** is for a company with no Brokerage Sales Manager (`salesManagerApproval()` in `server.ts`):
+
+```
+Sales agent enters the agreed rate  → nothing is sent yet (routeLockedRate waits)
+Agent clicks "Hand off to Operations"  (POST /quotes/:id/submit, optional operations_department_id)
+  ├─ the customer already has an active Operations agent → straight to that agent (as for later loads)
+  └─ otherwise → quote OPS_REVIEW, reviewed_at set, Operations Manager notified, "📤 … handed to Operations" in Quotes
+       department = the one sent, else the customer's, else the only active Brokerage Operations department;
+       with several and none chosen: 422 "Choose the Operations department for this customer."
+Operations Manager reviews  (POST /shipments/:id/ops-review), unchanged
+  ├─ approves and assigns the customer's agent → HANDED_OFF
+  └─ rejects with a reason → quote REJECTED, rejection_note "Operations: <reason>", load leaves Operations,
+       the agent is notified to fix it and hand it off again, or cancel the load
+```
+
+Turning the switch **off** (`PUT /api/v1/admin/brokerage-settings`) moves what was waiting for the Sales Manager: each SUBMITTED first load with an agreed rate goes on to Operations review when its department can be chosen automatically (otherwise back to DRAFT for the agent to hand off), and each OPS_REJECTED quote becomes REJECTED for its agent. The response reports `moved: { to_operations, to_agent }`; the change is audited as `BROKERAGE_SETTINGS_UPDATED`. Turning it back **on** moves nothing: loads in Draft show "Submit for approval" again.
+
+The Sales Manager's other screens (Teams, Agent access, team performance, reports) are unchanged; with no Sales Manager, the Super Admin manages the people side through Users, Attendance and Performance. Payroll needs nothing: no Sales Manager on staff means no Sales Manager profit share.
+
 ## 5.4 Quote stages
 
 | Stage | Meaning |
