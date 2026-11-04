@@ -25,7 +25,7 @@ Prospect fields: company name (required), operator name and number, shipping con
 | Sales Manager | Rows of Fronters linked to any agent of their department | Every field and the status (not add or delete) |
 | Super Admin | All | All |
 
-The Sales view is the "Fronter mining sheet". Sales can edit any field and the status of their Fronters' rows, but can't add, paste or delete rows (those endpoints stay Fronter-only). Qualified rows are locked for everyone: they have become Sales leads and are edited on the lead page. There are no export buttons in the Fronter module (client request).
+The Sales view is the "Fronter mining sheet". Sales can edit any field and the status of their Fronters' rows, but can't add, paste or delete rows (those endpoints stay Fronter-only). A **Qualified** row is locked for Fronters (it has become a Sales lead), but Sales keeps editing its details: each change also updates the lead (company, contact name, email, phone and the company detail fields) and the customer profile's company and contact. Its status stays Qualified and it can't be deleted (`422: This prospect is now a Sales lead, so its status and agent can't change here.`). Edits made later on the lead page are not copied back to the sheet. There are no export buttons in the Fronter module (client request).
 
 ## 6.4 Adding rows
 
@@ -38,7 +38,7 @@ Setting `status: "QUALIFIED"` (`PATCH /api/v1/fronter/prospects/:id`) is the han
 1. **Which Sales agent gets it:** the `sales_agent_id` of the Fronter who mined the row. If that Fronter has no active linked agent, the request is refused: "This Fronter has no active Sales agent linked. Ask the Super Admin to set one on their user." (An explicit `assigned_to` is still accepted for older callers.)
 2. A **Sales lead** is created for that agent, in their Sales department and team, at status Qualified, with every detail the Fronter collected, `source: "Fronter · <source>"` and `fronter_prospect_id` pointing back.
 3. The **customer profile** is created at once (flow v2).
-4. The prospect is set to Qualified and **locked**: nobody can edit or delete it any more.
+4. The prospect is set to Qualified and **locked for Fronters**: only Sales can still edit its details (the lead follows), and nobody can delete it or change its status.
 5. The agent and their Sales Managers are notified ("New qualified lead for you"). Audit `PROSPECT_QUALIFIED`.
 
 ## 6.6 Linking a Fronter to a Sales agent

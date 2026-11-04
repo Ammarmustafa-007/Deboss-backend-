@@ -72,3 +72,25 @@ test("a Sales agent qualifying a Fronter's row takes it as their own lead", asyn
   assert.equal(tables.sales_leads.at(-1).owner_id, agent.id);
   assert.equal(tables.sales_leads.at(-1).company_name, "For Sales");
 });
+
+test("Sales keeps editing a Qualified row, and its lead and customer follow; the status and Fronter stay locked", async () => {
+  const row = tables.fronter_prospects.find((prospect) => prospect.id === id(32));
+  const leadRow = tables.sales_leads.find((lead) => lead.id === row.lead_id);
+  assert.ok(leadRow, "the qualified row has its lead");
+  const listed = (await call(agent.id, "/api/v1/fronter/prospects")).body.prospects.find((prospect: any) => prospect.id === id(32));
+  assert.equal(listed.editable, true);
+
+  const edited = await call(agent.id, `/api/v1/fronter/prospects/${id(32)}`, "PATCH", { company_name: "For Sales Ltd", email: "ops@forsales.test", commodity: "Paper" });
+  assert.equal(edited.status, 200, JSON.stringify(edited.body));
+  assert.equal(row.company_name, "For Sales Ltd");
+  assert.equal(leadRow.company_name, "For Sales Ltd");
+  assert.equal(leadRow.contact_email, "ops@forsales.test");
+  assert.equal(leadRow.commodity, "Paper");
+  assert.equal(tables.brokerage_customers.find((customer) => customer.lead_id === leadRow.id).company_name, "For Sales Ltd");
+
+  assert.equal((await call(agent.id, `/api/v1/fronter/prospects/${id(32)}`, "PATCH", { status: "CONTACTED" })).status, 422);
+  assert.equal(row.status, "QUALIFIED");
+  assert.equal((await call(otherAgent.id, `/api/v1/fronter/prospects/${id(32)}`, "PATCH", { commodity: "Glass" })).status, 403);
+  assert.equal((await call(id(10), `/api/v1/fronter/prospects/${id(32)}`, "PATCH", { commodity: "Glass" })).status, 422);
+  assert.equal(leadRow.commodity, "Paper");
+});

@@ -109,7 +109,7 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
       const leadIds = rows.map((row: any) => row.lead_id).filter(Boolean);
       const { data: leads } = leadIds.length ? await supabase.from("sales_leads").select("id, stage").in("id", leadIds) : { data: [] as any[] };
       const stageOf = new Map((leads ?? []).map((row: any) => [row.id, row.stage]));
-      response.json({ prospects: rows.map((row: any) => ({ ...row, created_by_name: people.get(row.created_by) ?? null, assigned_name: row.assigned_to ? people.get(row.assigned_to) ?? null : null, lead_stage: row.lead_id ? stageOf.get(row.lead_id) ?? null : null, editable: sales ? row.status !== "QUALIFIED" : canEdit(actor, scope, row), fields_locked: false })) });
+      response.json({ prospects: rows.map((row: any) => ({ ...row, created_by_name: people.get(row.created_by) ?? null, assigned_name: row.assigned_to ? people.get(row.assigned_to) ?? null : null, lead_stage: row.lead_id ? stageOf.get(row.lead_id) ?? null : null, editable: sales ? true : canEdit(actor, scope, row), fields_locked: false })) });
     } catch (error) { next(error); }
   });
 
@@ -138,8 +138,30 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
       const actor = request.actor!; const input = prospectUpdateSchema.parse(request.body); const supabase = adminClient(); const scope = await teamScope(actor);
       const { data: row } = await supabase.from("fronter_prospects").select("*").eq("id", uuid.parse(request.params.id)).maybeSingle();
       if (!row) return response.status(404).json({ error: "Prospect not found." });
-      if (row.status === "QUALIFIED") return response.status(422).json({ error: "This prospect is qualified and now belongs to Brokerage Sales." });
       const sales = isSales(actor);
+      if (row.status === "QUALIFIED") {
+        // A qualified row is now a Sales lead: only Sales (the Fronter's linked agent or their manager) keeps
+        // editing its details, and the lead and customer profile follow. Its status and agent stay fixed.
+        if (!sales) return response.status(422).json({ error: "This prospect is qualified and now belongs to Brokerage Sales." });
+        if (!(await linkedFronters(supabase, actor)).includes(row.created_by)) return response.status(403).json({ error: "This prospect belongs to a Fronter who doesn't work for you." });
+        const { status, assigned_to, ...fields } = input;
+        if ((status && status !== "QUALIFIED") || assigned_to !== undefined) return response.status(422).json({ error: "This prospect is now a Sales lead, so its status and agent can't change here." });
+        if (!Object.keys(fields).length) return response.status(422).json({ error: "Nothing to update." });
+        const { data, error } = await supabase.from("fronter_prospects").update(fields).eq("id", row.id).select().single(); if (error) throw error;
+        if (row.lead_id) {
+          const next_ = { ...row, ...fields };
+          const contact: Record<string, unknown> = {};
+          if ("company_name" in fields) contact.company_name = next_.company_name;
+          if ("shipping_contact" in fields || "operator_name" in fields) contact.contact_name = next_.shipping_contact || next_.operator_name || null;
+          if ("email" in fields) contact.contact_email = next_.email || null;
+          if ("phone" in fields) contact.contact_phone = next_.phone || null;
+          const details = Object.fromEntries(leadDetailKeys.filter((key) => key in fields).map((key) => [key, (fields as any)[key] ?? (key === "w9_received" ? false : null)]));
+          if (Object.keys(contact).length || Object.keys(details).length) await supabase.from("sales_leads").update({ ...contact, ...details }).eq("id", row.lead_id);
+          if (Object.keys(contact).length) await supabase.from("brokerage_customers").update(contact).eq("lead_id", row.lead_id);
+        }
+        await writeAudit(supabase, actor.id, "PROSPECT_UPDATED_AFTER_QUALIFY", "fronter_prospect", row.id, { fields: Object.keys(fields), lead_id: row.lead_id ?? null });
+        return response.json({ prospect: data });
+      }
       if (sales) {
         if (!(await linkedFronters(supabase, actor)).includes(row.created_by)) return response.status(403).json({ error: "This prospect belongs to a Fronter who doesn't work for you." });
       } else if (!canEdit(actor, scope, row)) return response.status(403).json({ error: "You can't edit this prospect." });
