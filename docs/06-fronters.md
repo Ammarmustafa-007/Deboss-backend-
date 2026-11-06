@@ -7,7 +7,7 @@ Fronters are a Brokerage department (`function = FRONTER`) that mine prospect co
 | Record | Table | Notes |
 |---|---|---|
 | Prospect | `fronter_prospects` | One company row. `created_by` is the Fronter who mined it (they keep the credit), `department_id` their Fronter department, `team_id` optional, `assigned_to` the Sales agent, `status`, and once qualified `lead_id`, `qualified_by`, `qualified_at`. Carries the same company detail columns as a Sales lead |
-| Commodity | `fronter_commodities` | A shared reference sheet: commodity, trucks used, best states, notes |
+| Commodity | `fronter_commodities` | One reference sheet shared by the Fronters and Brokerage Sales: commodity, trucks used, best states, notes. Everyone sees every row and edits their own (managers: their department's) |
 
 Prospect fields: company name (required), operator name and number, shipping contact, phone, email, truck type, load type (FTL, LTL, Both), shipping volume, commodity, lanes, physical address, other locations, billing address, contact, phone and email, payment terms, W-9 received, EIN, source, website, notes.
 
@@ -21,11 +21,11 @@ Prospect fields: company name (required), operator name and number, shipping con
 |---|---|---|
 | Fronter | Own rows (+ team's as a Team Lead with `fronter.prospects.view_team`) | Every field and the status of own rows (+ team's with `edit_team`) |
 | Fronter Manager | The department's rows | Everything in the department |
-| Linked Sales agent | Rows of every Fronter whose `sales_agent_id` is them | Every field and the status (not add or delete) |
-| Sales Manager | Rows of Fronters linked to any agent of their department | Every field and the status (not add or delete) |
+| Sales agent | Their own rows, and the rows of every Fronter whose `sales_agent_id` is them | Adds and pastes rows; every field and the status of all of them; deletes only their own (not Qualified) rows |
+| Sales Manager | Rows of their department's Sales people, and of Fronters linked to them | The same, deleting rows their department's Sales people added |
 | Super Admin | All | All |
 
-The Sales view is the "Fronter mining sheet". Sales can edit any field and the status of their Fronters' rows, but can't add, paste or delete rows (those endpoints stay Fronter-only). A **Qualified** row is locked for Fronters (it has become a Sales lead), but Sales keeps editing its details: each change also updates the lead (company, contact name, email, phone and the company detail fields) and the customer profile's company and contact. Its status stays Qualified and it can't be deleted (`422: This prospect is now a Sales lead, so its status and agent can't change here.`). Edits made later on the lead page are not copied back to the sheet. There are no export buttons in the Fronter module (client request).
+The Sales view is the "Fronter mining sheet". Sales work on it like a Fronter (client request): they add and paste companies (`POST /prospects`, stored with their Sales `department_id` and themselves as `created_by`), edit any field and the status of their own and their Fronters' rows, and delete the rows they added (`deletable` in the list response). Qualifying a row a Sales person added makes it **their own lead**; a Fronter's row goes to the Fronter's linked agent as before. Rows Sales add never count towards Fronter pay or Fronter reports (those count Fronters only). A **Qualified** row is locked for Fronters (it has become a Sales lead), but Sales keeps editing its details: each change also updates the lead (company, contact name, email, phone and the company detail fields) and the customer profile's company and contact. Its status stays Qualified and it can't be deleted (`422: This prospect is now a Sales lead, so its status and agent can't change here.`). Edits made later on the lead page are not copied back to the sheet. There are no export buttons in the Fronter module (client request).
 
 ## 6.4 Adding rows
 

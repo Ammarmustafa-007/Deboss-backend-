@@ -94,3 +94,34 @@ test("Sales keeps editing a Qualified row, and its lead and customer follow; the
   assert.equal((await call(id(10), `/api/v1/fronter/prospects/${id(32)}`, "PATCH", { commodity: "Glass" })).status, 422);
   assert.equal(leadRow.commodity, "Paper");
 });
+
+test("a Sales agent adds, edits and deletes their own companies, and qualifying one makes it their own lead", async () => {
+  const added = await call(agent.id, "/api/v1/fronter/prospects", "POST", { rows: [{ company_name: "Own Co" }, { company_name: "Own Two" }] });
+  assert.equal(added.status, 201, JSON.stringify(added.body));
+  const [own, ownTwo] = added.body.prospects;
+  assert.equal(own.created_by, agent.id);
+  assert.equal(own.department_id, salesDept.id);
+
+  const listed = (await call(agent.id, "/api/v1/fronter/prospects")).body.prospects;
+  assert.equal(listed.find((row: any) => row.id === own.id)?.deletable, true);
+  assert.equal(listed.find((row: any) => row.id === id(30))?.deletable, false, "a Fronter's row isn't the agent's to delete");
+  assert.equal((await call(otherAgent.id, "/api/v1/fronter/prospects")).body.prospects.some((row: any) => row.id === own.id), false);
+
+  assert.equal((await call(agent.id, `/api/v1/fronter/prospects/${id(31)}`, "DELETE")).status, 403);
+  assert.equal((await call(otherAgent.id, `/api/v1/fronter/prospects/${ownTwo.id}`, "DELETE")).status, 403);
+  assert.equal((await call(agent.id, `/api/v1/fronter/prospects/${ownTwo.id}`, "DELETE")).status, 200);
+
+  const qualified = await qualify(agent.id, own.id);
+  assert.equal(qualified.status, 200, JSON.stringify(qualified.body));
+  assert.equal(tables.sales_leads.find((lead) => lead.id === qualified.body.lead_id).owner_id, agent.id);
+  assert.equal((await call(agent.id, `/api/v1/fronter/prospects/${own.id}`, "DELETE")).status, 403, "a qualified row can't be deleted");
+});
+
+test("Fronters and Sales share one commodities sheet", async () => {
+  tables.fronter_commodities ??= [];
+  assert.equal((await call(id(10), "/api/v1/fronter/commodities", "POST", { commodity: "Steel coils" })).status, 201);
+  assert.equal((await call(agent.id, "/api/v1/fronter/commodities", "POST", { commodity: "Paper rolls" })).status, 201);
+  const seen = (await call(agent.id, "/api/v1/fronter/commodities")).body.commodities;
+  assert.deepEqual(seen.map((row: any) => row.commodity).sort(), ["Paper rolls", "Steel coils"]);
+  assert.deepEqual(seen.filter((row: any) => row.editable).map((row: any) => row.commodity), ["Paper rolls"]);
+});

@@ -95,14 +95,16 @@ A quote can be edited only in `DRAFT` or `REJECTED`. A cancelled load's quote ca
 ## 5.5 Load lifecycle (Operations)
 
 ```
-BOOKED → PICKED_UP → DELIVERED → COMPLETED (set automatically when the invoice is paid)
+IN_PROGRESS → BOOKED → PICKED_UP → DELIVERED → COMPLETED (set automatically when the invoice is paid)
 BOOKED → MISSED_PICKUP → BOOKED (re-booked) or CANCELLED
-BOOKED / MISSED_PICKUP → CANCELLED (needs a reason)
+IN_PROGRESS / BOOKED / MISSED_PICKUP → CANCELLED (needs a reason)
 ```
+
+**In progress** (migration 030): a load handed to Operations starts In progress, including while it waits for the Ops Manager's review, and becomes **Booked** by itself as soon as it has a carrier (`carrier_name`) and a carrier rate (`carrier_rate`), whichever is saved last (`carrierReady()` / `handedOffStatus()`). It is logged as a status change and posted in Updates ("📗 … booked with a carrier"). Approving a first load, or a later load going straight to the customer's agent, gives Booked at once if the carrier and rate are already there. Moving In progress → Booked by hand is refused without them (`422: Add the carrier and the carrier rate to book this load.`). Migration 031 moved loads that were Booked without a carrier or rate back to In progress.
 
 Rules in `PATCH /shipments/:id`:
 
-- Loads move **one step at a time** through Booked, Picked up, Delivered. A delivered load can't move back.
+- Loads move **one step at a time** through In progress, Booked, Picked up, Delivered. A delivered load can't move back.
 - **Picked up** needs a carrier. Picked up and Delivered fill today's date if none is set.
 - **Missed pickup** is only from Booked and needs a reason. Afterwards the load is re-booked or cancelled.
 - **Cancelled** is only before pickup and needs a reason. It also sets the Sales status to Cancelled.
@@ -168,10 +170,16 @@ Load documents (`shipment_documents`) and quote attachments are PDFs or images u
 Sales totals include `leads` (created in the period), `customers`, `shipments`, `quoted_value`, `agreed_value`, `gross_generated`, `pipeline_value`, and:
 
 - `onboarded_customers`: customers in scope (lead at Quoting or Customer) whose **first load** was added in the period
-- `shipping_customers`: customers in scope with a load under way now (Booked, Picked up or Missed pickup, not cancelled)
+- `shipping_customers`: customers in scope with a load under way now (In progress, Booked, Picked up or Missed pickup, not cancelled)
 
 Agents (not managers) always get the current month on screen, with no date range and no export. A Sales Agent sees leads this month, customers onboarded, customers currently shipping, and their loads without the quoted and agreed rates.
 
 ## 5.10 Pay
 
 How Brokerage work turns into commission and profit share is in [09-hr-payroll.md](09-hr-payroll.md). In short: **gross = agreed rate − carrier rate**, counted when the customer's invoice is paid, credited to the customer's Sales owner at that time and to the load's Operations agent.
+
+## Operations Manager: customer profiles
+
+An Operations Manager reads (never edits) the profile of every customer whose `operations_department_id` is their department (`opsManagerOf()`): `GET /customers` lists them and `GET /customers/:id/profile` returns the profile. The profile response carries `details`, the company details the Sales agent entered on the lead (contact, operator and shipping, locations, billing), and `customer.owner_name`, for every reader. Load pages link the customer name to this profile for managers.
+
+Each load also records the pickup and delivery point of contact's phone (`pickup_contact_phone`, `delivery_contact_phone`, migration 030).

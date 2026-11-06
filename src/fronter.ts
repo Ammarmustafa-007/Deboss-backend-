@@ -63,15 +63,20 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
     return response.status(403).json({ error: "This area is for the Fronters and Brokerage Sales." });
   }
   const sheetGuard = [requireUser, fronterOrSales] as Handler[];
+  /** The Sales people whose own rows this Sales user works on: an agent, themselves; a manager, their whole department. */
+  async function salesPeople(supabase: SupabaseClient, actor: Actor) {
+    if (!isManager(actor)) return [actor.id];
+    const { data } = await supabase.from("profiles").select("id").eq("department_id", actor.department_id!);
+    return [...new Set([actor.id, ...(data ?? []).map((row: any) => row.id as string)])];
+  }
+  /**
+   * Whose rows a Sales user sees and edits on the mining sheet: their own and their department's Sales people's
+   * (Sales add companies too, like a Fronter), plus every Fronter linked to those Sales agents.
+   */
   async function linkedFronters(supabase: SupabaseClient, actor: Actor) {
-    let agentIds = [actor.id];
-    if (isManager(actor)) {
-      const { data } = await supabase.from("profiles").select("id").eq("department_id", actor.department_id!).eq("role", "AGENT");
-      agentIds = (data ?? []).map((row: any) => row.id);
-    }
-    if (!agentIds.length) return [] as string[];
-    const { data } = await supabase.from("profiles").select("id").in("sales_agent_id", agentIds);
-    return (data ?? []).map((row: any) => row.id as string);
+    const people = await salesPeople(supabase, actor);
+    const { data } = await supabase.from("profiles").select("id").in("sales_agent_id", people);
+    return [...people, ...(data ?? []).map((row: any) => row.id as string)];
   }
   const canView = (actor: Actor, scope: Scope, row: any) => isSuper(actor) || (isManager(actor) && row.department_id === actor.department_id) || row.created_by === actor.id || lead(scope, "fronter.prospects.view_team", row);
   const canEdit = (actor: Actor, scope: Scope, row: any) => row.status !== "QUALIFIED" && (isSuper(actor) || (isManager(actor) && row.department_id === actor.department_id) || row.created_by === actor.id || lead(scope, "fronter.prospects.edit_team", row));
@@ -99,7 +104,7 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
       const actor = request.actor!; const supabase = adminClient(); const scope = await teamScope(actor);
       const sales = isSales(actor);
       const fronters = sales ? await linkedFronters(supabase, actor) : [];
-      if (sales && !fronters.length) return response.json({ prospects: [] });
+      const ownSales = new Set(sales ? await salesPeople(supabase, actor) : []);
       let query = supabase.from("fronter_prospects").select("*").order("created_at", { ascending: false }).limit(5000);
       if (sales) query = query.in("created_by", fronters);
       else if (!isSuper(actor)) query = query.eq("department_id", actor.department_id!);
@@ -109,15 +114,15 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
       const leadIds = rows.map((row: any) => row.lead_id).filter(Boolean);
       const { data: leads } = leadIds.length ? await supabase.from("sales_leads").select("id, stage").in("id", leadIds) : { data: [] as any[] };
       const stageOf = new Map((leads ?? []).map((row: any) => [row.id, row.stage]));
-      response.json({ prospects: rows.map((row: any) => ({ ...row, created_by_name: people.get(row.created_by) ?? null, assigned_name: row.assigned_to ? people.get(row.assigned_to) ?? null : null, lead_stage: row.lead_id ? stageOf.get(row.lead_id) ?? null : null, editable: sales ? true : canEdit(actor, scope, row), fields_locked: false })) });
+      response.json({ prospects: rows.map((row: any) => ({ ...row, created_by_name: people.get(row.created_by) ?? null, assigned_name: row.assigned_to ? people.get(row.assigned_to) ?? null : null, lead_stage: row.lead_id ? stageOf.get(row.lead_id) ?? null : null, editable: sales ? true : canEdit(actor, scope, row), deletable: row.status !== "QUALIFIED" && (sales ? ownSales.has(row.created_by) : canEdit(actor, scope, row)), fields_locked: false })) });
     } catch (error) { next(error); }
   });
 
   /** One row or many (paste / CSV import). Rows without a company name are skipped and reported. */
-  app.post("/api/v1/fronter/prospects", ...guard, async (request: Req, response, next) => {
+  app.post("/api/v1/fronter/prospects", ...sheetGuard, async (request: Req, response, next) => {
     try {
       const actor = request.actor!; const supabase = adminClient();
-      if (!isFronter(actor) || !actor.department_id) return response.status(403).json({ error: "Prospects are added by the Fronters department." });
+      if (!(isFronter(actor) || isSales(actor)) || !actor.department_id) return response.status(403).json({ error: "Prospects are added by the Fronters and Brokerage Sales." });
       const body = z.object({ rows: z.array(z.record(z.string(), z.unknown())).min(1).max(1000) }).parse(request.body);
       const valid: any[] = []; const skipped: { row: number; error: string }[] = [];
       body.rows.forEach((row, index) => {
@@ -174,10 +179,15 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
         if (!qualifier) return response.status(403).json({ error: "You can't qualify this prospect." });
         // The lead goes to the Sales agent the Fronter who mined it works for (set when the Fronter's login is created).
         if (!next_.assigned_to) {
-          const { data: miner } = await supabase.from("profiles").select("sales_agent_id").eq("id", row.created_by).maybeSingle();
-          const agents = await salesAgents(supabase);
-          if (!miner?.sales_agent_id || !agents.some((agent) => agent.id === miner.sales_agent_id)) return response.status(422).json({ error: "This Fronter has no active Sales agent linked. Ask the Super Admin to set one on their user." });
-          next_.assigned_to = miner.sales_agent_id;
+          const { data: miner } = await supabase.from("profiles").select("sales_agent_id, department_id, is_active, departments!profiles_department_id_fkey(business_unit, function)").eq("id", row.created_by).maybeSingle();
+          const minerDepartment: any = Array.isArray((miner as any)?.departments) ? (miner as any).departments[0] : (miner as any)?.departments;
+          if (minerDepartment?.business_unit === "BROKERAGE" && minerDepartment?.function === "SALES" && miner?.is_active) {
+            next_.assigned_to = row.created_by; // A company a Sales person added becomes their own lead.
+          } else {
+            const agents = await salesAgents(supabase);
+            if (!miner?.sales_agent_id || !agents.some((agent) => agent.id === miner.sales_agent_id)) return response.status(422).json({ error: "This Fronter has no active Sales agent linked. Ask the Super Admin to set one on their user." });
+            next_.assigned_to = miner.sales_agent_id;
+          }
         }
         const { data: owner } = await supabase.from("profiles").select("id, department_id").eq("id", next_.assigned_to).single();
         // The lead takes over everything the Fronter collected, so Sales sees and edits it on the lead itself.
@@ -207,12 +217,15 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
     } catch (error) { next(error); }
   });
 
-  app.delete("/api/v1/fronter/prospects/:id", ...guard, async (request: Req, response, next) => {
+  app.delete("/api/v1/fronter/prospects/:id", ...sheetGuard, async (request: Req, response, next) => {
     try {
       const actor = request.actor!; const supabase = adminClient(); const scope = await teamScope(actor);
       const { data: row } = await supabase.from("fronter_prospects").select("*").eq("id", uuid.parse(request.params.id)).maybeSingle();
       if (!row) return response.status(404).json({ error: "Prospect not found." });
-      if (!canEdit(actor, scope, row)) return response.status(403).json({ error: row.status === "QUALIFIED" ? "Qualified prospects can't be deleted." : "You can't delete this prospect." });
+      if (isSales(actor)) {
+        if (row.status === "QUALIFIED") return response.status(403).json({ error: "Qualified prospects can't be deleted." });
+        if (!(await salesPeople(supabase, actor)).includes(row.created_by)) return response.status(403).json({ error: "You can delete only the companies you added." });
+      } else if (!canEdit(actor, scope, row)) return response.status(403).json({ error: row.status === "QUALIFIED" ? "Qualified prospects can't be deleted." : "You can't delete this prospect." });
       const { error } = await supabase.from("fronter_prospects").delete().eq("id", row.id); if (error) throw error;
       await writeAudit(supabase, actor.id, "PROSPECT_DELETED", "fronter_prospect", row.id, { company_name: row.company_name });
       response.json({ ok: true });
@@ -220,25 +233,24 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
   });
 
   // ---- Commodities sheet ----------------------------------------------------------------------------------------
-  app.get("/api/v1/fronter/commodities", ...guard, async (request: Req, response, next) => {
+  // The commodities sheet is shared by the Fronters and Brokerage Sales: everyone sees every row and edits their own.
+  app.get("/api/v1/fronter/commodities", ...sheetGuard, async (request: Req, response, next) => {
     try {
-      const actor = request.actor!; const supabase = adminClient();
-      let query = supabase.from("fronter_commodities").select("*").order("commodity");
-      if (!isSuper(actor)) query = query.eq("department_id", actor.department_id!);
-      const { data, error } = await query; if (error) throw error;
+      const supabase = adminClient(); const actor = request.actor!;
+      const { data, error } = await supabase.from("fronter_commodities").select("*").order("commodity"); if (error) throw error;
       const people = await names(supabase, (data ?? []).map((row: any) => row.created_by));
-      response.json({ commodities: (data ?? []).map((row: any) => ({ ...row, created_by_name: people.get(row.created_by) ?? null, editable: isSuper(actor) || isManager(actor) || row.created_by === actor.id })) });
+      response.json({ commodities: (data ?? []).map((row: any) => ({ ...row, created_by_name: people.get(row.created_by) ?? null, editable: isSuper(actor) || (isManager(actor) && row.department_id === actor.department_id) || row.created_by === actor.id })) });
     } catch (error) { next(error); }
   });
-  app.post("/api/v1/fronter/commodities", ...guard, async (request: Req, response, next) => {
+  app.post("/api/v1/fronter/commodities", ...sheetGuard, async (request: Req, response, next) => {
     try {
       const actor = request.actor!; const input = commoditySchema.parse(request.body); const supabase = adminClient();
-      if (!isFronter(actor) || !actor.department_id) return response.status(403).json({ error: "Commodities are added by the Fronters department." });
+      if (!(isFronter(actor) || isSales(actor)) || !actor.department_id) return response.status(403).json({ error: "Commodities are added by the Fronters and Brokerage Sales." });
       const { data, error } = await supabase.from("fronter_commodities").insert({ ...input, department_id: actor.department_id, created_by: actor.id }).select().single(); if (error) throw error;
       response.status(201).json({ commodity: data });
     } catch (error) { next(error); }
   });
-  app.patch("/api/v1/fronter/commodities/:id", ...guard, async (request: Req, response, next) => {
+  app.patch("/api/v1/fronter/commodities/:id", ...sheetGuard, async (request: Req, response, next) => {
     try {
       const actor = request.actor!; const input = commoditySchema.partial().strict().parse(request.body); const supabase = adminClient();
       const { data: row } = await supabase.from("fronter_commodities").select("*").eq("id", uuid.parse(request.params.id)).maybeSingle();
@@ -248,7 +260,7 @@ export function registerFronterRoutes(app: Express, deps: Deps) {
       response.json({ commodity: data });
     } catch (error) { next(error); }
   });
-  app.delete("/api/v1/fronter/commodities/:id", ...guard, async (request: Req, response, next) => {
+  app.delete("/api/v1/fronter/commodities/:id", ...sheetGuard, async (request: Req, response, next) => {
     try {
       const actor = request.actor!; const supabase = adminClient();
       const { data: row } = await supabase.from("fronter_commodities").select("*").eq("id", uuid.parse(request.params.id)).maybeSingle();

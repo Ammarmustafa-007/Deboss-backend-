@@ -8,7 +8,7 @@ import { z } from "zod";
 import { registerPayrollRoutes } from "./payroll.js";
 import { registerDispatchRoutes } from "./dispatch.js";
 import { postEvent, registerChatRoutes, syncTeamGroup } from "./chat.js";
-import { registerFronterRoutes } from "./fronter.js";
+import { leadDetailKeys, registerFronterRoutes } from "./fronter.js";
 
 const port = Number(process.env.PORT ?? 4000);
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -112,8 +112,8 @@ const reviewSchema = z.object({ action: z.enum(["APPROVE", "REJECT"]), note: z.s
 });
 const handoffSchema = z.object({ operations_department_id: z.string().uuid(), reference_number: z.string().trim().min(3).max(64), customer_name: z.string().trim().min(2), team_id: z.string().uuid().nullable().optional() });
 // Load details the Operations Agent records (migration 019). Carrier identity never goes to Brokerage Sales (see withoutCarrier).
-const loadDetailSchema = { carrier_mc: z.string().trim().max(40).nullable().optional(), dispatcher_name: z.string().trim().max(160).nullable().optional(), dispatcher_phone: z.string().trim().max(40).nullable().optional(), dispatcher_email: z.string().trim().email().max(200).nullable().optional().or(z.literal("")), driver_name: z.string().trim().max(160).nullable().optional(), driver_phone: z.string().trim().max(40).nullable().optional(), truck_type_size: z.string().trim().max(120).nullable().optional(), truck_number: z.string().trim().max(40).nullable().optional(), trailer_number: z.string().trim().max(40).nullable().optional(), carrier_rate: z.number().nonnegative().nullable().optional(), pickup_facility: z.string().trim().max(160).nullable().optional(), pickup_address: z.string().trim().max(300).nullable().optional(), pickup_contact: z.string().trim().max(160).nullable().optional(), pickup_notes: z.string().trim().max(10000).nullable().optional(), pickup_po: z.string().trim().max(80).nullable().optional(), delivery_facility: z.string().trim().max(160).nullable().optional(), delivery_address: z.string().trim().max(300).nullable().optional(), delivery_contact: z.string().trim().max(160).nullable().optional(), delivery_notes: z.string().trim().max(10000).nullable().optional(), commodity_product: z.string().trim().max(160).nullable().optional(), commodity_weight: z.string().trim().max(60).nullable().optional(), commodity_pieces: z.string().trim().max(60).nullable().optional(), missed_pickup_reason: z.string().trim().max(1000).nullable().optional(), cancel_reason: z.string().trim().max(1000).nullable().optional() };
-const shipmentUpdateSchema = z.object({ ...loadDetailSchema, assigned_to: z.string().uuid().nullable().optional(), team_id: z.string().uuid().nullable().optional(), status: z.enum(["QUOTED", "BOOKED", "CARRIER_ASSIGNED", "MISSED_PICKUP", "PICKED_UP", "IN_TRANSIT", "DELIVERED", "PAID", "COMPLETED", "EXCEPTION", "CANCELLED"]).optional(), carrier_name: z.string().trim().max(160).nullable().optional(), exception_note: z.string().trim().max(3000).nullable().optional(), exception_owner_id: z.string().uuid().nullable().optional(), exception_resolution: z.string().trim().max(3000).nullable().optional(), invoice_ready: z.boolean().optional(), amount_quoted: z.number().nonnegative().nullable().optional(), amount_invoiced: z.number().nonnegative().nullable().optional(), amount_paid: z.number().nonnegative().nullable().optional(), payment_status: z.enum(["DRAFT", "SENT", "PENDING", "PAID", "OVERDUE", "CANCELLED"]).optional(), pickup_date: z.string().date().nullable().optional(), delivery_date: z.string().date().nullable().optional(), note: z.string().trim().max(3000).optional() });
+const loadDetailSchema = { carrier_mc: z.string().trim().max(40).nullable().optional(), dispatcher_name: z.string().trim().max(160).nullable().optional(), dispatcher_phone: z.string().trim().max(40).nullable().optional(), dispatcher_email: z.string().trim().email().max(200).nullable().optional().or(z.literal("")), driver_name: z.string().trim().max(160).nullable().optional(), driver_phone: z.string().trim().max(40).nullable().optional(), truck_type_size: z.string().trim().max(120).nullable().optional(), truck_number: z.string().trim().max(40).nullable().optional(), trailer_number: z.string().trim().max(40).nullable().optional(), carrier_rate: z.number().nonnegative().nullable().optional(), pickup_facility: z.string().trim().max(160).nullable().optional(), pickup_address: z.string().trim().max(300).nullable().optional(), pickup_contact: z.string().trim().max(160).nullable().optional(), pickup_contact_phone: z.string().trim().max(40).nullable().optional(), pickup_notes: z.string().trim().max(10000).nullable().optional(), pickup_po: z.string().trim().max(80).nullable().optional(), delivery_facility: z.string().trim().max(160).nullable().optional(), delivery_address: z.string().trim().max(300).nullable().optional(), delivery_contact: z.string().trim().max(160).nullable().optional(), delivery_contact_phone: z.string().trim().max(40).nullable().optional(), delivery_notes: z.string().trim().max(10000).nullable().optional(), commodity_product: z.string().trim().max(160).nullable().optional(), commodity_weight: z.string().trim().max(60).nullable().optional(), commodity_pieces: z.string().trim().max(60).nullable().optional(), missed_pickup_reason: z.string().trim().max(1000).nullable().optional(), cancel_reason: z.string().trim().max(1000).nullable().optional() };
+const shipmentUpdateSchema = z.object({ ...loadDetailSchema, assigned_to: z.string().uuid().nullable().optional(), team_id: z.string().uuid().nullable().optional(), status: z.enum(["QUOTED", "IN_PROGRESS", "BOOKED", "CARRIER_ASSIGNED", "MISSED_PICKUP", "PICKED_UP", "IN_TRANSIT", "DELIVERED", "PAID", "COMPLETED", "EXCEPTION", "CANCELLED"]).optional(), carrier_name: z.string().trim().max(160).nullable().optional(), exception_note: z.string().trim().max(3000).nullable().optional(), exception_owner_id: z.string().uuid().nullable().optional(), exception_resolution: z.string().trim().max(3000).nullable().optional(), invoice_ready: z.boolean().optional(), amount_quoted: z.number().nonnegative().nullable().optional(), amount_invoiced: z.number().nonnegative().nullable().optional(), amount_paid: z.number().nonnegative().nullable().optional(), payment_status: z.enum(["DRAFT", "SENT", "PENDING", "PAID", "OVERDUE", "CANCELLED"]).optional(), pickup_date: z.string().date().nullable().optional(), delivery_date: z.string().date().nullable().optional(), note: z.string().trim().max(3000).optional() });
 const salesShipmentStage = z.enum(["QUOTED", "BOOKED", "DELIVERED", "PAID", "CANCELLED"]);
 const customerUpdateSchema = z.object({ company_name: z.string().trim().min(2).max(180).optional(), contact_name: z.string().trim().max(160).nullable().optional(), contact_email: z.string().email().nullable().optional().or(z.literal("")), contact_phone: z.string().trim().max(80).nullable().optional() }).strict();
 const salesShipmentSchema = z.object({ reference_number: z.string().trim().min(3).max(64), pickup_location: z.string().trim().min(2).max(180), delivery_location: z.string().trim().min(2).max(180), equipment_type: z.string().trim().max(120).nullable().optional(), quoted_rate: z.number().nonnegative().nullable().optional(), agreed_rate: z.number().nonnegative().nullable().optional(), pickup_date: z.string().date().nullable().optional(), delivery_date: z.string().date().nullable().optional(), status: salesShipmentStage.default("QUOTED"), miles: z.number().nonnegative().max(100000).nullable().optional(), commodity_product: z.string().trim().max(160).nullable().optional(), commodity_weight: z.string().trim().max(60).nullable().optional(), load_notes: z.string().trim().max(2000).nullable().optional() });
@@ -182,7 +182,7 @@ async function operationsDepartmentFor(supabase: ReturnType<typeof adminClient>,
 /** A new customer's first load goes to the Operations Manager of `departmentId`, who approves it (assigning the customer's agent) or rejects it. */
 async function sendToOperationsReview(supabase: ReturnType<typeof adminClient>, load: any, customer: any, departmentId: string, actorId: string, post: string, body: string) {
   await supabase.from("brokerage_customers").update({ operations_department_id: departmentId }).eq("id", customer.id);
-  await supabase.from("brokerage_shipments").update({ operations_department_id: departmentId, ops_review: "PENDING", status: "QUOTED", assigned_to: null }).eq("id", load.id);
+  await supabase.from("brokerage_shipments").update({ operations_department_id: departmentId, ops_review: "PENDING", status: "IN_PROGRESS", assigned_to: null }).eq("id", load.id);
   const { data: opsManagers } = await supabase.from("profiles").select("id").eq("department_id", departmentId).eq("role", "MANAGER").eq("is_active", true);
   await postEvent(supabase as any, "QUOTES", actorId, post);
   if (opsManagers?.length) await supabase.from("notifications").insert(opsManagers.map((manager: any) => ({ recipient_id: manager.id, kind: "QUOTE_HANDED_OFF", title: `Review a new customer: ${customer.company_name}`, body, entity_type: "SHIPMENT", entity_id: load.id })));
@@ -195,10 +195,16 @@ async function submitForReview(supabase: ReturnType<typeof adminClient>, quote: 
   const reviewers = (await salesManagersOf(supabase, departmentId)).filter((id) => id !== actorId);
   if (reviewers.length) await supabase.from("notifications").insert(reviewers.map((recipient_id) => ({ recipient_id, kind: "QUOTE_SUBMITTED", title: automatic ? "Rate locked in: review the load" : "Quote awaiting review", body: automatic ? "An agreed rate was entered on a new customer's first load." : "A sales quote is ready for approval.", entity_type: "QUOTE", entity_id: quote.id })));
 }
+/**
+ * Load lifecycle (client feedback): a load handed to Operations is In progress until a carrier and its carrier rate are
+ * saved, then Booked -> Picked up -> Delivered -> Completed (when the invoice is paid).
+ */
+const carrierReady = (load: { carrier_name?: string | null; carrier_rate?: unknown }) => Boolean((load.carrier_name ?? "").trim()) && load.carrier_rate != null && load.carrier_rate !== "";
+const handedOffStatus = (load: { carrier_name?: string | null; carrier_rate?: unknown }) => carrierReady(load) ? "BOOKED" : "IN_PROGRESS";
 /** Hands a load straight to the customer's Operations agent (no review: the customer already has one). */
 async function handToCustomerAgent(supabase: ReturnType<typeof adminClient>, shipment: any, customer: any, actorId: string) {
   const now = new Date().toISOString();
-  const { data: updated } = await supabase.from("brokerage_shipments").update({ operations_department_id: customer.operations_department_id, assigned_to: customer.operations_agent_id, status: "BOOKED", sales_status: ["DELIVERED", "PAID"].includes(shipment.sales_status) ? shipment.sales_status : "BOOKED", ops_review: null }).eq("id", shipment.id).select().single();
+  const { data: updated } = await supabase.from("brokerage_shipments").update({ operations_department_id: customer.operations_department_id, assigned_to: customer.operations_agent_id, status: handedOffStatus(shipment), sales_status: ["DELIVERED", "PAID"].includes(shipment.sales_status) ? shipment.sales_status : "BOOKED", ops_review: null }).eq("id", shipment.id).select().single();
   // reviewed_at marks when the load was committed, which is what payroll credits (approved gross).
   if (shipment.quote_id) { await supabase.from("sales_quotes").update({ stage: "HANDED_OFF", reviewed_at: now }).eq("id", shipment.quote_id); await supabase.from("quote_events").insert({ quote_id: shipment.quote_id, actor_id: actorId, event_type: "QUOTE_HANDED_OFF", body: "Sent straight to the customer's Operations agent." }); }
   await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actorId, event_type: "ASSIGNED", body: customer.operations_agent_id });
@@ -313,6 +319,8 @@ function isManager(actor: BrokerageRequest["actor"]) { return actor?.role === "M
 function isSuper(actor: BrokerageRequest["actor"]) { return actor?.role === "SUPER_ADMIN"; }
 function isSales(actor: BrokerageRequest["actor"]) { return actor?.department?.business_unit === "BROKERAGE" && actor.department?.function === "SALES"; }
 function isOperations(actor: BrokerageRequest["actor"]) { return actor?.department?.business_unit === "BROKERAGE" && actor.department?.function === "OPERATIONS"; }
+/** The Operations Manager reads (never edits) the profile of a customer their department handles. */
+function opsManagerOf(actor: BrokerageRequest["actor"], customer: any) { return Boolean(actor && isManager(actor) && isOperations(actor) && customer?.operations_department_id && customer.operations_department_id === actor.department_id); }
 function canAccessSalesCustomer(actor: BrokerageRequest["actor"], customer: any, lead: any, scope: Awaited<ReturnType<typeof teamScope>>, edit = false) {
   if (!actor) return false;
   if (isSuper(actor)) return true;
@@ -751,15 +759,18 @@ app.get("/api/v1/brokerage/customers/:id/profile", requireBrokerageUser, async (
     const actor = request.actor!; const supabase = adminClient(); const customerId = z.string().uuid().parse(request.params.id);
     const { data: customer, error } = await supabase.from("brokerage_customers").select("*").eq("id", customerId).single();
     if (error || !customer) return response.status(404).json({ error: "Customer not found." });
-    const scope = await teamScope(actor); const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select("id, owner_id, team_id, department_id").eq("id", customer.lead_id).maybeSingle() : { data: null };
-    const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id) || customer.owner_id === actor.id || (lead && inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.view_team"));
+    const scope = await teamScope(actor); const { data: lead } = customer.lead_id ? await supabase.from("sales_leads").select(["id", "owner_id", "team_id", "department_id", "contact_name", "contact_email", "contact_phone", ...leadDetailKeys].join(", ")).eq("id", customer.lead_id).maybeSingle() as { data: any } : { data: null as any };
+    const allowed = isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id) || customer.owner_id === actor.id || (lead && inTeam(scope, lead.team_id, lead.owner_id) && scope.permissions.has("sales.leads.view_team")) || opsManagerOf(actor, customer);
     if (!allowed) return response.status(403).json({ error: "Customer is outside your work scope." });
     const [activities, comments, quotes, shipments] = await Promise.all([customer.lead_id ? supabase.from("lead_activities").select("*").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("record_comments").select("*").eq("entity_type", "CUSTOMER").eq("entity_id", customer.id).order("created_at", { ascending: false }), customer.lead_id ? supabase.from("sales_quotes").select("id, pickup_location, delivery_location, stage, quoted_rate, rejection_note, created_at").eq("lead_id", customer.lead_id).order("created_at", { ascending: false }) : Promise.resolve({ data: [] }), supabase.from("brokerage_shipments").select("id, quote_id, reference_number, status, sales_status, operations_department_id, pickup_location, delivery_location, equipment_type, amount_quoted, amount_agreed, carrier_rate, miles, load_notes, pickup_date, delivery_date, pickup_facility, pickup_address, pickup_contact, pickup_notes, pickup_po, delivery_facility, delivery_address, delivery_contact, delivery_notes, commodity_product, commodity_weight, commodity_pieces, missed_pickup_reason, cancel_reason, cancelled_at, created_at, updated_at, assigned:profiles!brokerage_shipments_assigned_to_fkey(full_name), brokerage_invoices(invoice_number, status)").eq("customer_id", customer.id).order("created_at", { ascending: false })]);
     const canManage = isSuper(actor) || (isManager(actor) && actor.department_id === customer.sales_department_id);
     // Documents Operations uploaded on this customer's loads, minus rate confirmations (they name the carrier).
     const loadIds = (shipments.data ?? []).map((row: any) => row.id);
     const { data: loadDocuments } = loadIds.length ? await supabase.from("shipment_documents").select("id, shipment_id, document_type, is_verified, created_at").in("shipment_id", loadIds).neq("document_type", "RATE_CONFIRMATION").order("created_at", { ascending: false }) : { data: [] as any[] };
-    response.json({ customer, documents: loadDocuments ?? [], can_edit: canAccessSalesCustomer(actor, customer, lead, scope, true), activities: await withAuthorDetails(supabase, activities.data ?? [], actor.id, canManage), comments: await withAuthorDetails(supabase, comments.data ?? [], actor.id, canManage), quotes: quotes.data ?? [], shipments: (await withStatusBeforeException(supabase, (shipments.data ?? []) as any[])).map(({ assigned, ...row }: any) => ({ ...row, ...profitOf(row), operations_agent_name: (Array.isArray(assigned) ? assigned[0] : assigned)?.full_name ?? null })) });
+    // The company details the Sales agent entered on the lead (contacts, addresses, billing, lanes...), for reading.
+    const details = lead ? Object.fromEntries(["contact_name", "contact_email", "contact_phone", ...leadDetailKeys].map((key) => [key, lead[key] ?? null])) : null;
+    const { data: owner } = customer.owner_id ? await supabase.from("profiles").select("full_name").eq("id", customer.owner_id).maybeSingle() : { data: null };
+    response.json({ customer: { ...customer, owner_name: owner?.full_name ?? null }, details, documents: loadDocuments ?? [], can_edit: canAccessSalesCustomer(actor, customer, lead, scope, true), activities: await withAuthorDetails(supabase, activities.data ?? [], actor.id, canManage), comments: await withAuthorDetails(supabase, comments.data ?? [], actor.id, canManage), quotes: quotes.data ?? [], shipments: (await withStatusBeforeException(supabase, (shipments.data ?? []) as any[])).map(({ assigned, ...row }: any) => ({ ...row, ...profitOf(row), operations_agent_name: (Array.isArray(assigned) ? assigned[0] : assigned)?.full_name ?? null })) });
   } catch (error) { next(error); }
 });
 
@@ -785,9 +796,15 @@ app.post("/api/v1/brokerage/customers/:id/comments", requireBrokerageUser, async
 app.get("/api/v1/brokerage/customers", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
   try {
     const actor = request.actor!;
-    if (!isSuper(actor) && !isSales(actor)) return response.status(403).json({ error: "Brokerage Sales access is required." });
+    const opsManager = isManager(actor) && isOperations(actor);
+    if (!isSuper(actor) && !isSales(actor) && !opsManager) return response.status(403).json({ error: "Brokerage Sales access is required." });
     const supabase = adminClient();
-    let query = supabase.from("brokerage_customers").select("id, lead_id, company_name, contact_name, contact_email, contact_phone, owner_id, sales_department_id, created_at, updated_at").order("updated_at", { ascending: false }).limit(200);
+    let query = supabase.from("brokerage_customers").select("id, lead_id, company_name, contact_name, contact_email, contact_phone, owner_id, sales_department_id, operations_department_id, created_at, updated_at").order("updated_at", { ascending: false }).limit(200);
+    // Operations Managers see the customers their department handles (read only).
+    if (opsManager) {
+      const { data, error } = await query.eq("operations_department_id", actor.department_id!); if (error) throw error;
+      return response.json({ customers: data ?? [] });
+    }
     if (!isSuper(actor)) {
       if (isManager(actor)) query = query.eq("sales_department_id", actor.department_id!);
       else {
@@ -1140,7 +1157,7 @@ app.post("/api/v1/brokerage/shipments/:id/ops-review", requireBrokerageUser, asy
     const now = new Date().toISOString();
     if (input.action === "APPROVE") {
       if (!await validDepartmentPeople(shipment.operations_department_id, [input.agent_id!])) return response.status(422).json({ error: "The agent must be active in this Operations department." });
-      const { data, error } = await supabase.from("brokerage_shipments").update({ assigned_to: input.agent_id, status: "BOOKED", sales_status: "BOOKED", ops_review: null }).eq("id", shipment.id).select().single(); if (error) throw error;
+      const { data, error } = await supabase.from("brokerage_shipments").update({ assigned_to: input.agent_id, status: handedOffStatus(shipment), sales_status: "BOOKED", ops_review: null }).eq("id", shipment.id).select().single(); if (error) throw error;
       if (customer) await supabase.from("brokerage_customers").update({ operations_agent_id: input.agent_id, operations_department_id: shipment.operations_department_id, operations_assigned_at: now }).eq("id", customer.id);
       if (shipment.quote_id) { await supabase.from("sales_quotes").update({ stage: "HANDED_OFF", ops_reviewed_by: actor.id, ops_reviewed_at: now, ops_rejection_note: null }).eq("id", shipment.quote_id); await supabase.from("quote_events").insert({ quote_id: shipment.quote_id, actor_id: actor.id, event_type: "QUOTE_OPS_APPROVED", body: input.note ?? null }); }
       await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "ASSIGNED", body: input.agent_id });
@@ -1279,12 +1296,12 @@ app.patch("/api/v1/brokerage/shipments/:id", requireBrokerageUser, async (reques
     // invoice is paid. Missed pickup (from Booked) is re-booked or cancelled; Cancelled (before pickup) needs a reason.
     // Exceptions are a flag on the load (a note and its resolution), not a step, so the load keeps its place.
     if (input.status && input.status !== shipment.status) {
-      const flow = ["BOOKED", "PICKED_UP", "DELIVERED"];
+      const flow = ["IN_PROGRESS", "BOOKED", "PICKED_UP", "DELIVERED"];
       if (input.status === "MISSED_PICKUP") {
         if (shipment.status !== "BOOKED") return response.status(422).json({ error: "Only a booked load can miss its pickup." });
         if (!(input.missed_pickup_reason ?? "").trim()) return response.status(422).json({ error: "Say what happened at pickup." });
       } else if (input.status === "CANCELLED") {
-        if (!["BOOKED", "MISSED_PICKUP"].includes(shipment.status)) return response.status(422).json({ error: "Only a load that hasn't been picked up can be cancelled." });
+        if (!["IN_PROGRESS", "BOOKED", "MISSED_PICKUP"].includes(shipment.status)) return response.status(422).json({ error: "Only a load that hasn't been picked up can be cancelled." });
         if (!(input.cancel_reason ?? "").trim()) return response.status(422).json({ error: "Give a reason to cancel this load." });
         Object.assign(update, { cancelled_at: new Date().toISOString(), cancelled_by: actor.id, sales_status: "CANCELLED" });
       } else if (shipment.status === "MISSED_PICKUP") {
@@ -1295,7 +1312,8 @@ app.patch("/api/v1/brokerage/shipments/:id", requireBrokerageUser, async (reques
         return response.status(422).json({ error: input.status === "EXCEPTION" ? "Report an exception from the Exception tab; the load keeps its status." : "That status isn't used for loads any more." });
       } else {
         const from = flow.indexOf(shipment.status); const to = flow.indexOf(input.status);
-        if (to < 0 || from < 0 || Math.abs(to - from) !== 1) return response.status(422).json({ error: "Loads move one step at a time: Booked, Picked up, Delivered." });
+        if (to < 0 || from < 0 || Math.abs(to - from) !== 1) return response.status(422).json({ error: "Loads move one step at a time: In progress, Booked, Picked up, Delivered." });
+        if (input.status === "BOOKED" && shipment.status === "IN_PROGRESS" && !carrierReady({ carrier_name: input.carrier_name !== undefined ? input.carrier_name : shipment.carrier_name, carrier_rate: input.carrier_rate !== undefined ? input.carrier_rate : shipment.carrier_rate })) return response.status(422).json({ error: "Add the carrier and the carrier rate to book this load." });
         if (to < from && from >= flow.indexOf("DELIVERED")) return response.status(422).json({ error: "A delivered load has been billed and cannot move back." });
         if (input.status === "PICKED_UP" && !(input.carrier_name ?? shipment.carrier_name ?? "").trim()) return response.status(422).json({ error: "Add the carrier before marking the load picked up." });
         const today = new Date().toISOString().slice(0, 10);
@@ -1305,7 +1323,13 @@ app.patch("/api/v1/brokerage/shipments/:id", requireBrokerageUser, async (reques
     }
     if (input.exception_note) (update as any).exception_resolution = input.exception_resolution ?? null;
     if (input.status === "DELIVERED" || input.status === "COMPLETED") (update as any).sales_status = "DELIVERED";
-    const { data, error } = await supabase.from("brokerage_shipments").update(update).eq("id", shipment.id).select().single(); if (error) throw error;
+    let { data, error } = await supabase.from("brokerage_shipments").update(update).eq("id", shipment.id).select().single(); if (error) throw error;
+    // In progress becomes Booked by itself once the carrier and its rate are saved (not while it waits for the Ops Manager).
+    if (!input.status && data.status === "IN_PROGRESS" && data.ops_review !== "PENDING" && carrierReady(data)) {
+      ({ data, error } = await supabase.from("brokerage_shipments").update({ status: "BOOKED" }).eq("id", shipment.id).select().single()); if (error) throw error;
+      await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "STATUS_CHANGED", from_status: "IN_PROGRESS", to_status: "BOOKED", body: "Booked: carrier and carrier rate added." });
+      await postEvent(supabase as any, "UPDATES", actor.id, `📗 ${shipment.reference_number} (${shipment.customer_name}) booked with a carrier.`);
+    }
     if (input.assigned_to !== undefined) { await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "ASSIGNED", body: input.assigned_to ?? "Unassigned" }); if (input.assigned_to && input.assigned_to !== actor.id) await supabase.from("notifications").insert({ recipient_id: input.assigned_to, kind: "SHIPMENT_ASSIGNED", title: "New shipment assignment", body: `${shipment.reference_number} is ready for your review.`, entity_type: "SHIPMENT", entity_id: shipment.id }); }
     if (input.team_id !== undefined) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "TEAM_ASSIGNED", body: input.team_id ?? "Team removed" });
     if (input.exception_owner_id !== undefined) { await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "EXCEPTION_OWNER_ASSIGNED", body: input.exception_owner_id ?? "Unassigned" }); if (input.exception_owner_id && input.exception_owner_id !== actor.id) await supabase.from("notifications").insert({ recipient_id: input.exception_owner_id, kind: "EXCEPTION_ASSIGNED", title: "Exception assigned", body: `${shipment.reference_number} needs your attention.`, entity_type: "SHIPMENT", entity_id: shipment.id }); }
@@ -1621,7 +1645,7 @@ app.get("/api/v1/brokerage/reports", requireBrokerageUser, async (request: Broke
     for (const load of ownedLoads ?? []) if (!firstLoad.has(load.customer_id) || load.created_at < firstLoad.get(load.customer_id)!) firstLoad.set(load.customer_id, load.created_at);
     const inPeriod = (stamp: string) => (!range.from || stamp >= `${range.from}T00:00:00.000Z`) && (!range.to || stamp <= `${range.to}T23:59:59.999Z`);
     const onboardedCustomers = [...firstLoad.values()].filter(inPeriod).length;
-    const shippingCustomers = new Set((ownedLoads ?? []).filter((load: any) => ["BOOKED", "PICKED_UP", "MISSED_PICKUP"].includes(load.status) && load.sales_status !== "CANCELLED").map((load: any) => load.customer_id)).size;
+    const shippingCustomers = new Set((ownedLoads ?? []).filter((load: any) => ["IN_PROGRESS", "BOOKED", "PICKED_UP", "MISSED_PICKUP"].includes(load.status) && load.sales_status !== "CANCELLED").map((load: any) => load.customer_id)).size;
     response.json({
       range,
       sales: {
