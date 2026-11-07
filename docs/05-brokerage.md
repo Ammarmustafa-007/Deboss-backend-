@@ -128,7 +128,7 @@ Sales sees a load's carrier **rate** and the **profit**, never who the carrier i
 - Created automatically when a load is marked **Delivered** (`ensureInvoice()`), or by hand (`POST /shipments/:id/invoice`, only after delivery).
 - Number: `INV-<year>-<load reference>-<first 6 of the load id>`.
 - Amount: the invoiced amount, else the agreed rate, else the quoted rate.
-- Due date: **30 days** after it is issued.
+- Due date: **15 days after the load's delivery date** (`invoiceDueDate()`; today + 15 if there's no delivery date yet). Changing the delivery date moves the due date of an unpaid invoice. Migration 032 corrected the invoices issued before.
 - Status flow (`INVOICE_FLOW`):
 
 | From | Can move to |
@@ -139,7 +139,7 @@ Sales sees a load's carrier **rate** and the **profit**, never who the carrier i
 | `OVERDUE` | `PENDING`, `PAID`, `CANCELLED` |
 | `PAID`, `CANCELLED` | final |
 
-- **Overdue** is set by the system: a Sent or Pending invoice past its due date (`markOverdueInvoices()`, run whenever invoices are listed). The creator and the department's managers are notified.
+- **Overdue** is set by the system: a Draft, Sent or Pending invoice past its due date, so from the day after the due date (`markOverdueInvoices()`, run whenever invoices are listed). The creator and the department's managers are notified.
 - **Paid** means fully collected. A missing paid amount is filled with the full amount; a smaller one is refused ("Use Pending for a partial payment").
 - Paying a delivered load's invoice sets the load to **Completed**, the Sales status to Paid, and posts "🎉 … is completed" in Updates.
 - Who can generate or update invoices: the department's Operations Manager, a Team Lead with `operations.billing.mark_invoice_ready`, or the Super Admin.
@@ -183,3 +183,5 @@ How Brokerage work turns into commission and profit share is in [09-hr-payroll.m
 An Operations Manager reads (never edits) the profile of every customer whose `operations_department_id` is their department (`opsManagerOf()`): `GET /customers` lists them and `GET /customers/:id/profile` returns the profile. The profile response carries `details`, the company details the Sales agent entered on the lead (contact, operator and shipping, locations, billing), and `customer.owner_name`, for every reader. Load pages link the customer name to this profile for managers.
 
 Each load also records the pickup and delivery point of contact's phone (`pickup_contact_phone`, `delivery_contact_phone`, migration 030).
+
+The Operations Manager can also take a customer or a load themselves: the agent pickers (`GET /operations-directory`) list the department's agents and its manager, shown as "(Manager)", and `validDepartmentPeople()` accepts either.

@@ -15,7 +15,7 @@ Code: `src/chat.ts`, migrations 016, 017, 023. Messages are sent and received **
 | From → To | Allowed |
 |---|---|
 | Manager → any manager (any department or business unit) | Yes |
-| Manager → agent of **their own department** | Yes |
+| Manager → agent of **their own business unit** (Brokerage: Sales, Operations, Fronters; Dispatch: Sales, Operations) | Yes |
 | Agent → any manager | Yes |
 | Agent → agent | No (they use their team group) |
 | Super Admin ↔ anyone | No |
@@ -25,6 +25,8 @@ Code: `src/chat.ts`, migrations 016, 017, 023. Messages are sent and received **
 ## 8.3 Team groups
 
 `syncTeamGroup(teamId)` creates and maintains one `GROUP` per team. Members are the team's members, its Team Lead, and the department manager, who is the group `ADMIN`. It runs whenever a team is created or edited. The admin can rename the group and set its photo (stored in the public `chat-photos` bucket); nobody can leave a group by themselves.
+
+**Managers' own groups.** A manager creates a group (`POST /chat/groups` with a name and `member_ids`) with anyone they may message directly, and is its `ADMIN`. Its `team_id` is empty, so the admin adds and removes members themselves (`PATCH /chat/groups/:id` with `add_members` / `remove_members`; the admin can't remove themselves). Agents can't create groups. A team group's members still follow the team only.
 
 ## 8.4 Company channels
 
@@ -58,6 +60,7 @@ Messages can't be edited or deleted. There are no attachments.
 | `GET /chat/inbox` | Conversations with last message, unread count and members, plus who the caller may message |
 | `POST /chat/direct` | Open a direct conversation |
 | `GET /chat/conversations/:id/messages` | History |
-| `PATCH /chat/groups/:id` | Rename / photo (group admin) |
+| `POST /chat/groups` | A manager creates their own group (name, members) |
+| `PATCH /chat/groups/:id` | Rename / photo (group admin); add or remove members in a manager's own group |
 | `POST /chat/photo-upload-url` | Signed upload URL for a group photo (managers) |
 | `GET /admin/communication` | Super Admin: every team group and its members |

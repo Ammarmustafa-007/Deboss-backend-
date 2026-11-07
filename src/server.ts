@@ -248,12 +248,18 @@ async function writeAudit(supabase: ReturnType<typeof adminClient>, actorId: str
   await supabase.from("audit_events").insert({ actor_id: actorId, action, entity_type: entityType, entity_id: entityId, detail });
 }
 
-/** Creates the shipment's invoice once (IN-2). Defaults to net 30 so overdue tracking works (IN-4). */
+/** Brokerage invoices are due 15 days after delivery (client feedback); the next day they show as overdue. */
+const INVOICE_TERMS_DAYS = 15;
+const invoiceDueDate = (deliveryDate?: string | null) => {
+  const from = deliveryDate ? new Date(`${String(deliveryDate).slice(0, 10)}T00:00:00Z`) : new Date();
+  return new Date(from.getTime() + INVOICE_TERMS_DAYS * 86_400_000).toISOString().slice(0, 10);
+};
+/** Creates the shipment's invoice once (IN-2), due 15 days after the delivery date (or today, if it has none yet). */
 async function ensureInvoice(supabase: ReturnType<typeof adminClient>, shipment: any, actorId: string, input: { amount?: number; amount_paid?: number; status?: string; due_date?: string | null } = {}, automatic = false) {
   const { data: existing } = await supabase.from("brokerage_invoices").select("*").eq("shipment_id", shipment.id).maybeSingle();
   if (existing) return { invoice: existing, created: false };
   const issued = new Date();
-  const due = new Date(issued.getTime() + 30 * 86_400_000).toISOString().slice(0, 10);
+  const due = invoiceDueDate(shipment.delivery_date);
   const invoiceNumber = `INV-${issued.getUTCFullYear()}-${shipment.reference_number}-${shipment.id.slice(0, 6).toUpperCase()}`;
   const { data: invoice, error } = await supabase.from("brokerage_invoices").insert({ shipment_id: shipment.id, department_id: shipment.operations_department_id, invoice_number: invoiceNumber, amount: input.amount ?? shipment.amount_invoiced ?? shipment.amount_agreed ?? shipment.amount_quoted ?? 0, amount_paid: input.amount_paid ?? shipment.amount_paid ?? 0, status: input.status ?? "DRAFT", due_date: input.due_date === undefined ? due : input.due_date, issued_at: issued.toISOString(), created_by: actorId }).select().single();
   if (error || !invoice) throw error;
@@ -265,11 +271,11 @@ async function ensureInvoice(supabase: ReturnType<typeof adminClient>, shipment:
  * Flags unpaid invoices past their due date as Overdue (IN-4), audits the change (IN-5) and notifies the
  * invoice creator and the department's Operations managers. Runs on a schedule and when invoices are listed.
  */
-/** Allowed manual invoice moves. Overdue is applied by the system once a sent invoice passes its due date. */
-const INVOICE_FLOW: Record<string, string[]> = { DRAFT: ["SENT", "CANCELLED"], SENT: ["PENDING", "PAID", "CANCELLED"], PENDING: ["PAID", "CANCELLED"], OVERDUE: ["PENDING", "PAID", "CANCELLED"], PAID: [], CANCELLED: [] };
+/** Allowed manual invoice moves. Overdue is applied by the system once an unpaid invoice passes its due date. */
+const INVOICE_FLOW: Record<string, string[]> = { DRAFT: ["SENT", "CANCELLED"], SENT: ["PENDING", "PAID", "CANCELLED"], PENDING: ["PAID", "CANCELLED"], OVERDUE: ["SENT", "PENDING", "PAID", "CANCELLED"], PAID: [], CANCELLED: [] };
 
 async function markOverdueInvoices(supabase: ReturnType<typeof adminClient>, departmentId?: string) {
-  let overdueQuery = supabase.from("brokerage_invoices").select("id, invoice_number, status, created_by, department_id").lt("due_date", new Date().toISOString().slice(0, 10)).in("status", ["SENT", "PENDING"]);
+  let overdueQuery = supabase.from("brokerage_invoices").select("id, invoice_number, status, created_by, department_id").lt("due_date", new Date().toISOString().slice(0, 10)).in("status", ["DRAFT", "SENT", "PENDING"]);
   if (departmentId) overdueQuery = overdueQuery.eq("department_id", departmentId);
   const { data: overdue, error } = await overdueQuery;
   if (error) throw error;
@@ -350,7 +356,8 @@ async function withStatusBeforeException<T extends { id: string; status?: string
 async function validDepartmentPeople(departmentId: string, ids: string[]) {
   if (!ids.length) return true;
   const { data, error } = await adminClient().from("profiles").select("id, role").eq("department_id", departmentId).eq("is_active", true).in("id", ids);
-  return !error && (data ?? []).length === ids.length && (data ?? []).every((person: any) => person.role === "AGENT");
+  // The department's agents, and its manager (who may take a customer or a load themselves).
+  return !error && (data ?? []).length === ids.length && (data ?? []).every((person: any) => ["AGENT", "MANAGER"].includes(person.role));
 }
 
 app.get("/health", (_request, response) => response.json({ status: "ok", service: "deboss-api", timestamp: new Date().toISOString() }));
@@ -1255,7 +1262,7 @@ app.get("/api/v1/brokerage/operations-directory", requireBrokerageUser, async (r
     const scope = isManager(actor) ? null : await teamScope(actor);
     if (scope && !(scope.leadTeamIds.length && scope.permissions.has("operations.shipments.view_team"))) return response.status(403).json({ error: "Only a Brokerage Operations Manager or Team Lead can view this directory." });
     const supabase = adminClient();
-    let userQuery = supabase.from("profiles").select("id, full_name, email, role").eq("department_id", actor.department_id).eq("is_active", true).eq("role", "AGENT");
+    let userQuery = supabase.from("profiles").select("id, full_name, email, role").eq("department_id", actor.department_id).eq("is_active", true).in("role", scope ? ["AGENT"] : ["AGENT", "MANAGER"]);
     let teamQuery = supabase.from("teams").select("id, name, team_lead_id").eq("department_id", actor.department_id).eq("is_active", true).order("name");
     if (scope) { userQuery = userQuery.in("id", scope.memberIds.length ? scope.memberIds : ["00000000-0000-0000-0000-000000000000"]); teamQuery = teamQuery.in("id", scope.leadTeamIds); }
     const [{ data: users, error }, { data: teams, error: teamsError }] = await Promise.all([userQuery, teamQuery]); if (error || teamsError) throw error ?? teamsError; response.json({ users: users ?? [], teams: teams ?? [] }); } catch (error) { next(error); }
@@ -1342,6 +1349,8 @@ app.patch("/api/v1/brokerage/shipments/:id", requireBrokerageUser, async (reques
       const { created, invoice } = await ensureInvoice(supabase, data, actor.id, {}, true);
       if (created) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "INVOICE_GENERATED", body: invoice.invoice_number });
     }
+    // The invoice is due 15 days after delivery, so a changed delivery date moves the due date of an unpaid invoice.
+    if (data.delivery_date && data.delivery_date !== shipment.delivery_date) await supabase.from("brokerage_invoices").update({ due_date: invoiceDueDate(data.delivery_date) }).eq("shipment_id", shipment.id).not("status", "in", "(PAID,CANCELLED)");
     if (input.exception_note !== undefined) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: input.exception_note ? "EXCEPTION_RAISED" : "EXCEPTION_RESOLVED", body: input.exception_note ?? null });
     // A newly raised exception alerts the department's Operations managers.
     if (input.exception_note && input.exception_note !== shipment.exception_note && shipment.operations_department_id) {

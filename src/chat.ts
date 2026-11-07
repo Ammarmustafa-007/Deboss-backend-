@@ -5,9 +5,11 @@ import { z } from "zod";
 /**
  * Chat module.
  *  - Direct messages: manager <-> manager (whole company) and agent <-> manager. Agent <-> agent is never allowed.
- *    A manager can start a message with agents of their own department; an agent can message any manager.
- *  - Groups: one per team, created and kept in sync from the team form. The team's manager is the group admin
- *    (rename, photo, members); nobody can leave. Messages can't be edited or deleted.
+ *    A manager can start a message with the agents of their business unit (Brokerage: Sales, Operations and Fronters;
+ *    Dispatch: Sales and Operations); an agent can message any manager.
+ *  - Groups: one per team, created and kept in sync from the team form (members follow the team). Managers also create
+ *    their own groups with anyone they may message directly, and manage those members themselves. The creator / the
+ *    team's manager is the group admin (rename, photo); nobody can leave. Messages can't be edited or deleted.
  *  - Channels (client flow v2, section 8): Quotes (Brokerage Sales + Operations), Updates (also Fronters) and Company
  *    announcements (everyone reads; managers and the Super Admin post). Membership follows the person's department and is
  *    synced on every inbox load. Key Brokerage events are posted into Quotes / Updates as EVENT messages (postEvent).
@@ -99,13 +101,15 @@ export function registerChatRoutes(app: Express, deps: Deps) {
   /** Who this person may start a direct message with. */
   async function contactsFor(supabase: SupabaseClient, actor: Actor) {
     const { data: people } = await supabase.from("profiles").select("id, full_name, role, department_id, departments!profiles_department_id_fkey(name, business_unit, function)").eq("is_active", true).in("role", ["MANAGER", "AGENT"]).neq("id", actor.id).order("full_name");
-    return (people ?? []).filter((person: any) => person.role === "MANAGER" || (actor.role === "MANAGER" && person.department_id === actor.department_id))
+    return (people ?? []).filter((person: any) => person.role === "MANAGER" || (actor.role === "MANAGER" && (person.department_id === actor.department_id || sameUnit(actor, one(person.departments)))))
       .map((person: any) => { const department = one(person.departments); return { id: person.id, full_name: person.full_name, role: person.role, department: department?.name ?? null }; });
   }
-  function mayDirect(actor: Actor, other: { role: string; department_id: string | null; is_active: boolean }) {
+  /** Brokerage managers talk with Brokerage agents (Sales, Operations, Fronters), Dispatch managers with Dispatch agents. */
+  const sameUnit = (actor: Actor, department?: { business_unit?: string } | null) => Boolean(actor.department?.business_unit && department?.business_unit === actor.department.business_unit);
+  function mayDirect(actor: Actor, other: { role: string; department_id: string | null; is_active: boolean; departments?: any }) {
     if (!other.is_active || !["MANAGER", "AGENT"].includes(other.role)) return false;
     if (actor.role === "AGENT" && other.role === "AGENT") return false;
-    if (actor.role === "MANAGER" && other.role === "AGENT") return other.department_id === actor.department_id;
+    if (actor.role === "MANAGER" && other.role === "AGENT") return other.department_id === actor.department_id || sameUnit(actor, one(other.departments));
     return true;
   }
 
@@ -149,7 +153,7 @@ export function registerChatRoutes(app: Express, deps: Deps) {
       const actor = request.actor!; const { user_id } = z.object({ user_id: uuid }).parse(request.body); const supabase = adminClient();
       if (actor.role === "SUPER_ADMIN") return response.status(403).json({ error: "The Super Admin uses Company announcements, not direct messages." });
       if (user_id === actor.id) return response.status(422).json({ error: "Choose someone else." });
-      const { data: other } = await supabase.from("profiles").select("id, role, department_id, is_active").eq("id", user_id).maybeSingle();
+      const { data: other } = await supabase.from("profiles").select("id, role, department_id, is_active, departments!profiles_department_id_fkey(business_unit)").eq("id", user_id).maybeSingle();
       if (!other || !mayDirect(actor, other)) return response.status(403).json({ error: actor.role === "AGENT" ? "Agents can message managers directly; talk with other agents in your team group." : "You can't start a direct message with this person." });
       const key = directKey(actor.id, user_id);
       const { data: existing } = await supabase.from("chat_conversations").select("id").eq("direct_key", key).maybeSingle();
@@ -179,15 +183,46 @@ export function registerChatRoutes(app: Express, deps: Deps) {
     } catch (error) { next(error); }
   });
 
-  /** Group admin (the team's manager): rename and photo. Members are managed through the team. */
+  /** A manager's own group: a name and anyone they may message directly. They become its admin. */
+  app.post("/api/v1/chat/groups", ...guard, async (request: Req, response, next) => {
+    try {
+      const actor = request.actor!; const supabase = adminClient();
+      if (actor.role !== "MANAGER") return response.status(403).json({ error: "Managers create group chats." });
+      const input = z.object({ name: z.string().trim().min(2).max(80), member_ids: z.array(uuid).min(1, "Choose at least one member.").max(100) }).strict().parse(request.body);
+      const allowed = new Set((await contactsFor(supabase, actor)).map((person) => person.id));
+      const members = [...new Set(input.member_ids)].filter((id) => id !== actor.id);
+      if (!members.length || members.some((id) => !allowed.has(id))) return response.status(422).json({ error: "You can add only people you can message directly." });
+      const { data: conversation, error } = await supabase.from("chat_conversations").insert({ kind: "GROUP", name: input.name, created_by: actor.id }).select("id").single(); if (error) throw error;
+      await supabase.from("chat_members").insert([{ conversation_id: conversation.id, user_id: actor.id, role: "ADMIN" }, ...members.map((user_id) => ({ conversation_id: conversation.id, user_id, role: "MEMBER" }))]);
+      await writeAudit(supabase, actor.id, "CHAT_GROUP_CREATED", "chat_conversation", conversation.id, { name: input.name, members: members.length });
+      response.status(201).json({ conversation_id: conversation.id });
+    } catch (error) { next(error); }
+  });
+
+  /**
+   * Group admin: rename and photo. In a group a manager created, the admin also adds and removes members;
+   * a team group's members follow the team instead.
+   */
   app.patch("/api/v1/chat/groups/:id", ...guard, async (request: Req, response, next) => {
     try {
       const actor = request.actor!; const id = uuid.parse(request.params.id); const supabase = adminClient();
-      const input = z.object({ name: z.string().trim().min(2).max(80).optional(), photo_url: z.string().url().max(500).nullable().optional() }).strict().parse(request.body);
-      const { data: member } = await supabase.from("chat_members").select("role, chat_conversations(kind)").eq("conversation_id", id).eq("user_id", actor.id).maybeSingle();
-      if (!member || member.role !== "ADMIN" || one((member as any).chat_conversations)?.kind !== "GROUP") return response.status(403).json({ error: "Only the group admin can change the group." });
-      const { data, error } = await supabase.from("chat_conversations").update(input).eq("id", id).select().single(); if (error) throw error;
-      await writeAudit(supabase, actor.id, "CHAT_GROUP_UPDATED", "chat_conversation", id, { fields: Object.keys(input) });
+      const input = z.object({ name: z.string().trim().min(2).max(80).optional(), photo_url: z.string().url().max(500).nullable().optional(), add_members: z.array(uuid).max(100).optional(), remove_members: z.array(uuid).max(100).optional() }).strict().parse(request.body);
+      const { data: member } = await supabase.from("chat_members").select("role, chat_conversations(kind, team_id)").eq("conversation_id", id).eq("user_id", actor.id).maybeSingle();
+      const group = one((member as any)?.chat_conversations) as { kind?: string; team_id?: string | null } | null;
+      if (!member || member.role !== "ADMIN" || group?.kind !== "GROUP") return response.status(403).json({ error: "Only the group admin can change the group." });
+      const { add_members, remove_members, ...settings } = input;
+      if ((add_members?.length || remove_members?.length) && group.team_id) return response.status(422).json({ error: "This is a team group: its members follow the team." });
+      if (add_members?.length) {
+        const allowed = new Set((await contactsFor(supabase, actor)).map((person) => person.id));
+        if (add_members.some((userId) => !allowed.has(userId))) return response.status(422).json({ error: "You can add only people you can message directly." });
+        await supabase.from("chat_members").upsert(add_members.map((user_id) => ({ conversation_id: id, user_id, role: "MEMBER" })), { onConflict: "conversation_id,user_id", ignoreDuplicates: true });
+      }
+      if (remove_members?.length) {
+        if (remove_members.includes(actor.id)) return response.status(422).json({ error: "The admin stays in the group." });
+        await supabase.from("chat_members").delete().eq("conversation_id", id).in("user_id", remove_members);
+      }
+      const { data, error } = Object.keys(settings).length ? await supabase.from("chat_conversations").update(settings).eq("id", id).select().single() : await supabase.from("chat_conversations").select().eq("id", id).single(); if (error) throw error;
+      await writeAudit(supabase, actor.id, "CHAT_GROUP_UPDATED", "chat_conversation", id, { fields: Object.keys(settings), added: add_members?.length ?? 0, removed: remove_members?.length ?? 0 });
       response.json({ conversation: data });
     } catch (error) { next(error); }
   });
