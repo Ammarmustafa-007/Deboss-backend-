@@ -76,7 +76,7 @@ Operations Manager reviews  (POST /shipments/:id/ops-review), unchanged
 
 Turning the switch **off** (`PUT /api/v1/admin/brokerage-settings`) moves what was waiting for the Sales Manager: each SUBMITTED first load with an agreed rate goes on to Operations review when its department can be chosen automatically (otherwise back to DRAFT for the agent to hand off), and each OPS_REJECTED quote becomes REJECTED for its agent. The response reports `moved: { to_operations, to_agent }`; the change is audited as `BROKERAGE_SETTINGS_UPDATED`. Turning it back **on** moves nothing: loads in Draft show "Submit for approval" again.
 
-The Sales Manager's other screens (Teams, Agent access, team performance, reports) are unchanged; with no Sales Manager, the Super Admin manages the people side through Users, Attendance and Performance. Payroll needs nothing: no Sales Manager on staff means no Sales Manager profit share.
+With the step off, every Brokerage agent reports to the **Brokerage Operations Manager**: their Team performance and Attendance screens also list the Brokerage Sales agents and the Fronters (`managedDepartmentIds()` in `payroll.ts`), and they record those people's attendance. Turning the step back on returns each department to its own manager. The Super Admin still manages users through Users. Payroll needs nothing: no Sales Manager on staff means no Sales Manager profit share.
 
 ## 5.4 Quote stages
 

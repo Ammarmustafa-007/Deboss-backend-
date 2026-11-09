@@ -16,7 +16,7 @@ Code: `src/chat.ts`, migrations 016, 017, 023. Messages are sent and received **
 |---|---|
 | Manager → any manager (any department or business unit) | Yes |
 | Manager → agent of **their own business unit** (Brokerage: Sales, Operations, Fronters; Dispatch: Sales, Operations) | Yes |
-| Agent → any manager | Yes |
+| Agent → manager of **their own business unit** (a Brokerage agent → Brokerage managers; a Dispatch agent → Dispatch managers) | Yes |
 | Agent → agent | No (they use their team group) |
 | Super Admin ↔ anyone | No |
 

@@ -476,7 +476,21 @@ export function registerPayrollRoutes(app: Express, { adminClient, requireSuperA
     } catch (error) { next(error); }
   });
 
-  // ---- Attendance: managers record their own department, the Super Admin everyone. No row means Present. ----
+  /**
+   * Departments whose people a manager looks after: their own. While the Brokerage Sales Manager step is off
+   * (Super Admin setting, brokerage_settings), the Brokerage Operations Manager also looks after the Brokerage
+   * Sales agents and the Fronters, so every Brokerage agent reports to them.
+   */
+  async function managedDepartmentIds(supabase: SupabaseClient, actor: Actor): Promise<string[]> {
+    const own = actor.department_id ? [actor.department_id] : [];
+    if (actor.role !== "MANAGER" || actor.department?.business_unit !== "BROKERAGE" || actor.department?.function !== "OPERATIONS") return own;
+    const { data: setting, error } = await supabase.from("brokerage_settings").select("sales_manager_approval").eq("id", true).maybeSingle();
+    if (error || !setting || (setting as any).sales_manager_approval !== false) return own;
+    const { data } = await supabase.from("departments").select("id").eq("business_unit", "BROKERAGE").in("function", ["SALES", "FRONTER"]).eq("is_active", true);
+    return [...new Set([...own, ...(data ?? []).map((row: any) => row.id as string)])];
+  }
+
+  // ---- Attendance: managers record their own department (see managedDepartmentIds), the Super Admin everyone. No row means Present. ----
   app.get("/api/v1/attendance", requireBrokerageUser, async (request, response, next) => {
     try {
       const actor = (request as Request & { actor?: Actor }).actor!;
@@ -485,7 +499,7 @@ export function registerPayrollRoutes(app: Express, { adminClient, requireSuperA
       const supabase = adminClient();
       const days = workingDays(period);
       let query = supabase.from("profiles").select("id, full_name, role, department_id, is_active, created_at, departments!profiles_department_id_fkey(name, business_unit, function)").in("role", ["AGENT", "MANAGER"]).order("full_name");
-      if (actor.role === "MANAGER") query = query.eq("department_id", actor.department_id!).neq("id", actor.id);
+      if (actor.role === "MANAGER") query = query.in("department_id", await managedDepartmentIds(supabase, actor)).neq("id", actor.id);
       const [people, employeeRecords, records, rules, locked] = await Promise.all([
         must<any[]>(query),
         must<any[]>(supabase.from("employee_records").select("user_id, joined_on, last_working_day")),
@@ -513,7 +527,7 @@ export function registerPayrollRoutes(app: Express, { adminClient, requireSuperA
       const input = attendanceSchema.parse(request.body);
       const supabase = adminClient();
       const { data: target } = await supabase.from("profiles").select("id, department_id").eq("id", input.user_id).maybeSingle();
-      const allowed = actor.role === "SUPER_ADMIN" || (actor.role === "MANAGER" && target?.department_id === actor.department_id && target?.id !== actor.id);
+      const allowed = actor.role === "SUPER_ADMIN" || (actor.role === "MANAGER" && Boolean(target?.department_id) && (await managedDepartmentIds(supabase, actor)).includes(target!.department_id) && target?.id !== actor.id);
       if (!target || !allowed) return response.status(403).json({ error: "You can't record attendance for this person." });
       if (!workingDays(input.date.slice(0, 7)).includes(input.date)) return response.status(422).json({ error: "Attendance is recorded for Monday to Friday only." });
       if (await isFinalized(supabase, input.date.slice(0, 7))) return response.status(409).json({ error: lockedMessage });
@@ -699,8 +713,13 @@ export function registerPayrollRoutes(app: Express, { adminClient, requireSuperA
       const actor = (request as Request & { actor?: Actor }).actor!;
       if (!["MANAGER", "SUPER_ADMIN"].includes(actor.role)) return response.status(403).json({ error: "Only managers see team performance." });
       const period = periodSchema.parse(request.query.period ?? currentPeriod());
-      const figures = await monthFigures(adminClient(), period);
-      const lines = figures.lines.filter((line) => actor.role === "SUPER_ADMIN" ? true : line.department_id === actor.department_id && !line.role_key.endsWith("MANAGER") && ["department", actor.id].includes(figures.teamKey(actor.department_id!, line.user_id)));
+      const supabase = adminClient();
+      const figures = await monthFigures(supabase, period);
+      // Their own department's agents (by team, as before), plus the agents of any department they stand in for.
+      const extra = actor.role === "MANAGER" ? (await managedDepartmentIds(supabase, actor)).filter((id) => id !== actor.department_id) : [];
+      const lines = figures.lines.filter((line) => actor.role === "SUPER_ADMIN" ? true : !line.role_key.endsWith("MANAGER") && (
+        (line.department_id === actor.department_id && ["department", actor.id].includes(figures.teamKey(actor.department_id!, line.user_id)))
+        || (line.department_id != null && extra.includes(line.department_id))));
       response.json({ period, people: lines.map((line) => progressOf(line, figures.rules, figures.departmentIncome(line))) });
     } catch (error) { next(error); }
   });

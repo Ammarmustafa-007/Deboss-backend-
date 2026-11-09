@@ -4,9 +4,8 @@ import { z } from "zod";
 
 /**
  * Chat module.
- *  - Direct messages: manager <-> manager (whole company) and agent <-> manager. Agent <-> agent is never allowed.
- *    A manager can start a message with the agents of their business unit (Brokerage: Sales, Operations and Fronters;
- *    Dispatch: Sales and Operations); an agent can message any manager.
+ *  - Direct messages: manager <-> manager (whole company) and agent <-> manager within one business unit
+ *    (Brokerage: Sales, Operations and Fronters; Dispatch: Sales and Operations). Agent <-> agent is never allowed.
  *  - Groups: one per team, created and kept in sync from the team form (members follow the team). Managers also create
  *    their own groups with anyone they may message directly, and manage those members themselves. The creator / the
  *    team's manager is the group admin (rename, photo); nobody can leave. Messages can't be edited or deleted.
@@ -101,7 +100,9 @@ export function registerChatRoutes(app: Express, deps: Deps) {
   /** Who this person may start a direct message with. */
   async function contactsFor(supabase: SupabaseClient, actor: Actor) {
     const { data: people } = await supabase.from("profiles").select("id, full_name, role, department_id, departments!profiles_department_id_fkey(name, business_unit, function)").eq("is_active", true).in("role", ["MANAGER", "AGENT"]).neq("id", actor.id).order("full_name");
-    return (people ?? []).filter((person: any) => person.role === "MANAGER" || (actor.role === "MANAGER" && (person.department_id === actor.department_id || sameUnit(actor, one(person.departments)))))
+    return (people ?? []).filter((person: any) => person.role === "MANAGER"
+        ? actor.role === "MANAGER" || sameUnit(actor, one(person.departments)) // agents: only their business unit's managers
+        : actor.role === "MANAGER" && (person.department_id === actor.department_id || sameUnit(actor, one(person.departments))))
       .map((person: any) => { const department = one(person.departments); return { id: person.id, full_name: person.full_name, role: person.role, department: department?.name ?? null }; });
   }
   /** Brokerage managers talk with Brokerage agents (Sales, Operations, Fronters), Dispatch managers with Dispatch agents. */
@@ -110,6 +111,8 @@ export function registerChatRoutes(app: Express, deps: Deps) {
     if (!other.is_active || !["MANAGER", "AGENT"].includes(other.role)) return false;
     if (actor.role === "AGENT" && other.role === "AGENT") return false;
     if (actor.role === "MANAGER" && other.role === "AGENT") return other.department_id === actor.department_id || sameUnit(actor, one(other.departments));
+    // An agent talks only with the managers of their own business unit (Brokerage or Dispatch).
+    if (actor.role === "AGENT" && other.role === "MANAGER") return sameUnit(actor, one(other.departments));
     return true;
   }
 

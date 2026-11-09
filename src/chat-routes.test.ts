@@ -32,7 +32,7 @@ after(() => { server.close(); });
 
 const call = async (actor: string, path: string, method = "GET", body?: unknown) => {
   const response = await fetch(`${base}${path}`, { method, headers: { "x-actor": actor, "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
-  return { status: response.status, body: await response.json() };
+  const text = await response.text(); try { return { status: response.status, body: JSON.parse(text) }; } catch { throw new Error(`${response.status} ${text.slice(0, 300)}`); }
 };
 
 test("a Brokerage manager messages Brokerage agents of other departments, never Dispatch agents; agents still can't message agents", async () => {
@@ -56,4 +56,17 @@ test("managers create their own group, manage its members, and agents can't crea
   assert.equal((await call(opsManager.id, `/api/v1/chat/groups/${group}`, "PATCH", { remove_members: [salesAgent.id] })).status, 200);
   assert.ok(!members().some((row) => row.startsWith(salesAgent.id)));
   assert.equal((await call(opsManager.id, `/api/v1/chat/groups/${group}`, "PATCH", { remove_members: [opsManager.id] })).status, 422, "the admin stays");
+});
+
+test("an agent messages only the managers of their own business unit", async () => {
+  const dispatchManager = profile(40, "MANAGER", dispatchDept);
+  tables.profiles.push(dispatchManager);
+  assert.ok([200, 201].includes((await call(salesAgent.id, "/api/v1/chat/direct", "POST", { user_id: opsManager.id })).status), "allowed (already open from the first test)");
+  assert.equal((await call(salesAgent.id, "/api/v1/chat/direct", "POST", { user_id: dispatchManager.id })).status, 403);
+  assert.equal((await call(dispatchAgent.id, "/api/v1/chat/direct", "POST", { user_id: dispatchManager.id })).status, 201);
+  assert.equal((await call(dispatchAgent.id, "/api/v1/chat/direct", "POST", { user_id: opsManager.id })).status, 403);
+  assert.equal((await call(opsManager.id, "/api/v1/chat/direct", "POST", { user_id: dispatchManager.id })).status, 201, "managers still talk across the company");
+  const inbox = await call(salesAgent.id, "/api/v1/chat/inbox"); assert.equal(inbox.status, 200, JSON.stringify(inbox.body));
+  const contacts = inbox.body.contacts.map((person: any) => person.id);
+  assert.ok(contacts.includes(opsManager.id) && !contacts.includes(dispatchManager.id));
 });

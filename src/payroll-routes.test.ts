@@ -136,3 +136,27 @@ test("a finalized month refuses changes", async () => {
   assert.equal((await call(ids.boss, "/api/v1/admin/costs", "POST", { period: "2020-01", name: "x", amount: 1, currency: "USD", cost_type: "COMPANY_ONLY", department_ids: [] })).status, 409);
   assert.equal((await call(ids.boss, "/api/v1/admin/payroll/2020-01/rate", "PUT", { usd_to_pkr: 280 })).status, 409);
 });
+
+test("with the Brokerage Sales Manager step off, the Brokerage Operations Manager looks after the Sales agents too", async () => {
+  const opsTeam = async () => JSON.parse((await call(ids.opsm, "/api/v1/performance/team?period=2026-10")).text).people.map((row: any) => row.user_id);
+  const opsAttendance = async () => JSON.parse((await call(ids.opsm, "/api/v1/attendance?period=2026-10")).text).people.map((row: any) => row.id);
+  // Switch on (or never set): their own department only.
+  assert.ok(!(await opsTeam()).includes(ids.a1));
+  assert.equal((await call(ids.opsm, "/api/v1/attendance", "PUT", { user_id: ids.a1, date: day, status: "ABSENT" })).status, 403);
+
+  Object.assign(sales, { is_active: true });
+  tables.brokerage_settings = [{ id: true, sales_manager_approval: false }];
+  try {
+    const team = await opsTeam();
+    assert.ok(team.includes(ids.opsa) && team.includes(ids.a1) && team.includes(ids.a2) && team.includes(ids.a3));
+    assert.ok(!team.includes(ids.m1) && !team.includes(ids.m2), "managers aren't listed as reports");
+    const people = await opsAttendance();
+    assert.ok(people.includes(ids.a1) && people.includes(ids.opsa) && !people.includes(ids.opsm));
+    assert.equal((await call(ids.opsm, "/api/v1/attendance", "PUT", { user_id: ids.a1, date: day, status: "ABSENT" })).status, 200);
+    assert.equal((await call(ids.opsm, "/api/v1/attendance", "PUT", { user_id: ids.a1, date: day, status: "PRESENT" })).status, 200);
+    // A Sales manager still sees only their own team.
+    assert.deepEqual(JSON.parse((await call(ids.m1, "/api/v1/performance/team?period=2026-10")).text).people.map((row: any) => row.user_id), [ids.a1]);
+  } finally {
+    delete tables.brokerage_settings;
+  }
+});

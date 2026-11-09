@@ -45,6 +45,7 @@ export function fakeSupabase(tables: Record<string, any[]>) {
       neq: (key: string, value: unknown) => { filters.push((row) => row[key] !== value); return builder; },
       in: (key: string, values: unknown[]) => { filters.push((row) => values.includes(row[key])); return builder; },
       gte: (key: string, value: string) => { filters.push((row) => row[key] != null && row[key] >= value); return builder; },
+      gt: (key: string, value: string) => { filters.push((row) => row[key] != null && row[key] > value); return builder; },
       lt: (key: string, value: string) => { filters.push((row) => row[key] != null && row[key] < value); return builder; },
       lte: (key: string, value: string) => { filters.push((row) => row[key] != null && row[key] <= value); return builder; },
       not: (key: string, op: string, value: string) => { filters.push((row) => op === "in" ? !value.slice(1, -1).split(",").includes(row[key]) : row[key] != null); return builder; },
