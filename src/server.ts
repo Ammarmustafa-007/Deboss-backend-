@@ -946,6 +946,11 @@ app.get("/api/v1/brokerage/notifications", requireBrokerageUser, async (request:
   try { const { data, error } = await adminClient().from("notifications").select("*").eq("recipient_id", request.actor!.id).order("created_at", { ascending: false }).limit(50); if (error) throw error; response.json({ notifications: data ?? [] }); } catch (error) { next(error); }
 });
 
+/** Marks every unread notification of the caller as read (the bell's and the inbox's "Mark all as read"). */
+app.patch("/api/v1/brokerage/notifications/read-all", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
+  try { const { data, error } = await adminClient().from("notifications").update({ read_at: new Date().toISOString() }).eq("recipient_id", request.actor!.id).is("read_at", null).select("id"); if (error) throw error; response.json({ marked: data?.length ?? 0 }); } catch (error) { next(error); }
+});
+
 app.patch("/api/v1/brokerage/notifications/:id/read", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
   try { const { data, error } = await adminClient().from("notifications").update({ read_at: new Date().toISOString() }).eq("id", z.string().uuid().parse(request.params.id)).eq("recipient_id", request.actor!.id).select().single(); if (error || !data) return response.status(404).json({ error: "Notification not found." }); response.json({ notification: data }); } catch (error) { next(error); }
 });

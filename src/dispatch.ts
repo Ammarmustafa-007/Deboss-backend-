@@ -763,7 +763,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
   // ---- Weekly invoices (DP-8, DP-9, DS-12, IN-1..IN-6, answer 2) ------------------------------------------------
 
   async function invoiceRows(supabase: SupabaseClient, filter: (query: any) => any) {
-    const { data, error } = await filter(supabase.from("dispatch_invoices").select("*, dispatch_trucks(id, unit_number, truck_type, assigned_to, team_id, dispatch_department_id), dispatch_carriers(id, company_name, owner_id, team_id, department_id)").order("week_start", { ascending: false }).limit(1000));
+    const { data, error } = await filter(supabase.from("dispatch_invoices").select("*, dispatch_trucks(id, unit_number, truck_type, assigned_to, team_id, dispatch_department_id), dispatch_carriers(id, company_name, owner_id, team_id, department_id, mc_number, dot_number, contact_name, phone, email, payment_method)").order("week_start", { ascending: false }).limit(1000));
     if (error) throw error;
     return data ?? [];
   }
