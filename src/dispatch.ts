@@ -762,6 +762,14 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
 
   // ---- Weekly invoices (DP-8, DP-9, DS-12, IN-1..IN-6, answer 2) ------------------------------------------------
 
+  const invoiceName = (number: string) => /^\d+$/.test(number) ? `Invoice #${number}` : number;
+  /** Dispatch invoice numbers run 01, 02, 03... (client request): the highest plain number so far, plus one. */
+  async function nextInvoiceNumber(supabase: SupabaseClient) {
+    const { data } = await supabase.from("dispatch_invoices").select("invoice_number").limit(100000);
+    const highest = (data ?? []).reduce((max: number, row: any) => /^\d+$/.test(String(row.invoice_number)) ? Math.max(max, Number(row.invoice_number)) : max, 0);
+    return String(highest + 1).padStart(2, "0");
+  }
+
   async function invoiceRows(supabase: SupabaseClient, filter: (query: any) => any) {
     const { data, error } = await filter(supabase.from("dispatch_invoices").select("*, dispatch_trucks(id, unit_number, truck_type, assigned_to, team_id, dispatch_department_id), dispatch_carriers(id, company_name, owner_id, team_id, department_id, mc_number, dot_number, contact_name, phone, email, payment_method)").order("week_start", { ascending: false }).limit(1000));
     if (error) throw error;
@@ -803,11 +811,13 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       if ((loads ?? []).some((load: any) => load.invoice_id)) return response.status(422).json({ error: "Some of those loads are already on another invoice." });
       const dates = (loads ?? []).map((load: any) => load.pickup_date as string).sort();
       const week = weekStart(dates[0]);
-      const number = `DSP-${week.replaceAll("-", "")}-${truck.unit_number.replace(/[^A-Za-z0-9]/g, "").slice(0, 10).toUpperCase() || "TRUCK"}-${crypto.randomUUID().slice(0, 6).toUpperCase()}`;
-      const { data: created, error } = await supabase.from("dispatch_invoices").insert({
-        invoice_number: number, truck_id: truck.id, carrier_id: carrier.id, dispatcher_id: truck.assigned_to, dispatch_department_id: truck.dispatch_department_id, sales_department_id: carrier.department_id, sales_agent_id: carrier.owner_id,
+      const fields = {
+        truck_id: truck.id, carrier_id: carrier.id, dispatcher_id: truck.assigned_to, dispatch_department_id: truck.dispatch_department_id, sales_department_id: carrier.department_id, sales_agent_id: carrier.owner_id,
         week_start: week, week_end: dates[dates.length - 1], gross_amount: 0, charge_percent: carrier.charge_percent, amount: 0, amount_paid: 0, status: "DRAFT", due_date: addDays(week, 13),
-      }).select("id").single();
+      };
+      // Two invoices created at the same moment could pick the same number: the unique number refuses one, which retries.
+      let { data: created, error } = await supabase.from("dispatch_invoices").insert({ ...fields, invoice_number: await nextInvoiceNumber(supabase) }).select("id").single();
+      for (let attempt = 0; attempt < 3 && (error as any)?.code === "23505"; attempt += 1) ({ data: created, error } = await supabase.from("dispatch_invoices").insert({ ...fields, invoice_number: await nextInvoiceNumber(supabase) }).select("id").single());
       if (error || !created) throw error;
       const { error: linkError } = await supabase.from("dispatch_loads").update({ invoice_id: created.id }).in("id", ids).is("invoice_id", null);
       if (linkError) { await supabase.from("dispatch_invoices").delete().eq("id", created.id); throw linkError; }
@@ -914,7 +924,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
       }
       if (input.action === "SIGN_OFF") Object.assign(update, { signed_off_at: now, signed_off_by: actor.id });
       const { data, error } = await supabase.from("dispatch_invoices").update(update).eq("id", invoice.id).select().single(); if (error) throw error;
-      const label = `${invoice.invoice_number} · ${carrier.company_name} ${truck.unit_number}`;
+      const label = `${invoiceName(invoice.invoice_number)} · ${carrier.company_name} ${truck.unit_number}`;
       const alert = async () => {
         if (input.action === "SUBMIT") return notify(supabase, await managersOf(supabase, invoice.dispatch_department_id), actor.id, "DISPATCH_INVOICE_SUBMITTED", "Weekly invoice to review", label, "DISPATCH_INVOICE", invoice.id);
         if (input.action === "RETURN") return notify(supabase, [invoice.dispatcher_id], actor.id, "DISPATCH_INVOICE_RETURNED", "Invoice returned", input.note!, "DISPATCH_INVOICE", invoice.id);
@@ -946,12 +956,32 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
         editable ? supabase.from("dispatch_loads").select("*").eq("truck_id", invoice.truck_id).is("invoice_id", null).neq("status", "CANCELLED").order("pickup_date", { ascending: false }).limit(200) : Promise.resolve({ data: [] as any[] }),
       ]);
       const people = await names(supabase, [invoice.dispatcher_id, invoice.sales_agent_id, ...(history ?? []).map((row: any) => row.actor_id)]);
+      // The dispatcher's pseudo name (the name carriers know them by) goes on the invoice instead of their real name.
+      const { data: dispatcherProfile } = await supabase.from("profiles").select("pseudo_name").eq("id", invoice.dispatcher_id).maybeSingle();
       response.json({
-        invoice: decorate(invoice, people), loads: loads ?? [], available_loads: free ?? [],
+        invoice: { ...decorate(invoice, people), dispatcher_pseudo_name: (dispatcherProfile as any)?.pseudo_name ?? null }, loads: loads ?? [], available_loads: free ?? [],
         comments: await withAuthorDetails(supabase, comments ?? [], actor.id, isManager(actor) || isSuper(actor)),
         history: (history ?? []).map((row: any) => ({ ...row, actor_name: people.get(row.actor_id) ?? null })),
-        rights: { dispatcher: truckOpsUpdate(actor, scope, truck), reviewer: invoiceReview(actor, scope, invoice, truck), sign_off: invoiceSignOff(actor, scope, invoice, carrier), edit: editable },
+        rights: { dispatcher: truckOpsUpdate(actor, scope, truck), reviewer: invoiceReview(actor, scope, invoice, truck), sign_off: invoiceSignOff(actor, scope, invoice, carrier), edit: editable, pseudo_name: truckOpsUpdate(actor, scope, truck) || invoiceReview(actor, scope, invoice, truck) },
       });
+    } catch (error) { next(error); }
+  });
+
+  /** The name on invoices: the invoice's dispatcher (or their reviewer) sets the dispatcher's pseudo name, used on all their invoices. */
+  app.patch("/api/v1/dispatch/invoices/:id/dispatcher-name", ...guard, async (request: Req, response, next) => {
+    try {
+      const actor = request.actor!; const supabase = adminClient(); const scope = await teamScope(actor);
+      const { pseudo_name } = z.object({ pseudo_name: z.string().trim().max(100).nullable() }).strict().parse(request.body);
+      const [invoice] = await invoiceRows(supabase, (query) => query.eq("id", uuid.parse(request.params.id)));
+      if (!invoice) return response.status(404).json({ error: "Invoice not found." });
+      const truck = one(invoice.dispatch_trucks);
+      if (!(truckOpsUpdate(actor, scope, truck) || invoiceReview(actor, scope, invoice, truck))) return response.status(403).json({ error: "Only the Dispatcher or their reviewer can change the name on invoices." });
+      const name = pseudo_name && pseudo_name.length ? pseudo_name : null;
+      if (name && name.length < 2) return response.status(422).json({ error: "Use at least 2 characters." });
+      const { error } = await supabase.from("profiles").update({ pseudo_name: name }).eq("id", invoice.dispatcher_id);
+      if (error) return response.status(503).json({ error: "Run migration 20261111_033_dispatch_invoice_numbers_and_pseudo_names.sql in Supabase first." });
+      await writeAudit(supabase, actor.id, "DISPATCHER_PSEUDO_NAME_SET", "profile", invoice.dispatcher_id, { pseudo_name: name, invoice_id: invoice.id });
+      response.json({ pseudo_name: name });
     } catch (error) { next(error); }
   });
 
@@ -973,7 +1003,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
         if (!invoice) return response.status(404).json({ error: "Invoice not found." });
         const truck = one(invoice.dispatch_trucks); const carrier = one(invoice.dispatch_carriers);
         if (!(truckOpsView(actor, scope, truck) || carrierSalesView(actor, scope, carrier) || invoiceReview(actor, scope, invoice, truck))) return response.status(403).json({ error: "This invoice is outside your work scope." });
-        recipients = [invoice.dispatcher_id, ...(isManager(actor) ? [] : await managersOf(supabase, invoice.dispatch_department_id))]; label = invoice.invoice_number;
+        recipients = [invoice.dispatcher_id, ...(isManager(actor) ? [] : await managersOf(supabase, invoice.dispatch_department_id))]; label = invoiceName(invoice.invoice_number);
       }
       const { data, error } = await supabase.from("record_comments").insert({ entity_type: input.entity_type, entity_id: input.entity_id, author_id: actor.id, body: input.body }).select().single(); if (error) throw error;
       await notify(supabase, recipients, actor.id, "DISPATCH_COMMENT", `New comment · ${label}`, input.body, input.entity_type, input.entity_id);

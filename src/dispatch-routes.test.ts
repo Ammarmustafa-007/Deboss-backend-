@@ -64,6 +64,9 @@ test("the Dispatcher picks loads, and a second invoice in the same week works", 
   second = two.body.invoice.id;
   assert.equal(Number(two.body.invoice.gross_amount), 750);
   assert.notEqual(invoice(first).invoice_number, invoice(second).invoice_number);
+  // Numbered 01, 02... (client request).
+  assert.equal(invoice(first).invoice_number, "01");
+  assert.equal(invoice(second).invoice_number, "02");
   assert.equal((await call(people.dispatcher, `/api/v1/dispatch/trucks/${truck.id}/invoices`, "POST", { load_ids: [id(41)] })).status, 422);
   assert.equal((await call(people.dispatcher, `/api/v1/dispatch/trucks/${truck.id}/invoices`, "POST", { load_ids: [id(44)] })).status, 422);
   assert.equal((await call(people.dispatcher, `/api/v1/dispatch/trucks/${truck.id}/invoices`, "POST", { load_ids: [] })).status, 422);
@@ -138,4 +141,15 @@ test("a Dispatch manager can take a truck themselves, like a Dispatcher", async 
   assert.equal(tables.dispatch_trucks[0].assigned_to, people.manager.id);
   assert.equal((await call(people.manager, `/api/v1/dispatch/trucks/${truck.id}`, "PATCH", { assigned_to: people.salesManager.id })).status, 422);
   await call(people.manager, `/api/v1/dispatch/trucks/${truck.id}`, "PATCH", { assigned_to: people.dispatcher.id });
+});
+
+test("the Dispatcher's pseudo name is set from an invoice and shown on every invoice of theirs", async () => {
+  const target = tables.dispatch_invoices.find((row: any) => row.dispatcher_id === people.dispatcher.id)!.id;
+  const set = await call(people.dispatcher, `/api/v1/dispatch/invoices/${target}/dispatcher-name`, "PATCH", { pseudo_name: "Mike Dispatch" });
+  assert.equal(set.status, 200, JSON.stringify(set.body));
+  const detail = await call(people.dispatcher, `/api/v1/dispatch/invoices/${target}/detail`);
+  assert.equal(detail.body.invoice.dispatcher_pseudo_name, "Mike Dispatch");
+  assert.equal(detail.body.rights.pseudo_name, true);
+  assert.equal((await call(people.agent, `/api/v1/dispatch/invoices/${target}/dispatcher-name`, "PATCH", { pseudo_name: "Nope" })).status, 403);
+  assert.equal((await call(people.dispatcher, `/api/v1/dispatch/invoices/${target}/dispatcher-name`, "PATCH", { pseudo_name: null })).status, 200);
 });

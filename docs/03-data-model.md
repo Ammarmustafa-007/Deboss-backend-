@@ -34,6 +34,7 @@ All data lives in Supabase Postgres, schema `public`. The schema is built **only
 | 028 | `delete_unused_user` | `delete_unused_user(uuid)` function |
 | 029 | `brokerage_settings` | `brokerage_settings` (one row): the Brokerage Sales Manager switch |
 | 030 | `in_progress_and_contact_phones` | `IN_PROGRESS` load status; `brokerage_shipments.pickup_contact_phone`, `delivery_contact_phone` |
+| 033 | `dispatch_invoice_numbers_and_pseudo_names` | `profiles.pseudo_name`; Dispatch invoices renumbered 01, 02… oldest first |
 | 032 | `invoice_due_15_days` | Unpaid Brokerage invoices due 15 days after delivery; those already past due become Overdue |
 | 031 | `in_progress_backfill` | Loads with Operations but no carrier or carrier rate move from Booked to In progress (run after 030, separately) |
 

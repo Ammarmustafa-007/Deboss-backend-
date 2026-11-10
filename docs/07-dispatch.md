@@ -61,7 +61,9 @@ DOCS_PENDING ──submit──→ PENDING_REVIEW ──approve──→ APPROVE
 - **Gross** = sum of the chosen (non-cancelled) loads' rates.
 - **Amount** (the fee) = gross × the carrier's charge % ÷ 100.
 - `week_start` = Monday of the earliest load, `week_end` = the latest load's pickup date, **due date** = week start + 13 days.
-- Number: `DSP-<week start>-<unit number>-<6 random characters>`.
+- Number: a plain running number, **01, 02, 03…** (client request; `nextInvoiceNumber()` takes the highest so far plus one and retries on a clash). Screens and notifications show it as "Invoice #01". Migration 033 renumbered the invoices issued before, oldest first.
+- **PDF:** the invoice drawer's Download PDF builds the invoice in the browser (`lib/invoice-pdf.ts`, jsPDF) under the **Backend Solutions** brand (logo, yellow and purple), not DEBOSS GLOBAL: bill-to with the carrier's MC, DOT, contact and payment method; invoice details; the loads table; totals and balance due.
+- **Name on invoices:** a dispatcher can have a **pseudo name** (`profiles.pseudo_name`), the name carriers know them by. The invoice drawer and the PDF show it instead of their real name. The invoice's Dispatcher or reviewer sets it from the drawer (`PATCH /dispatch/invoices/:id/dispatcher-name`); it applies to all of that dispatcher's invoices.
 - The carrier's charge % must be set first.
 
 `recomputeInvoice()` recalculates gross, amount and the week dates from the invoice's loads whenever loads are added, removed or edited.
