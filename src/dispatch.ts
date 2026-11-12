@@ -72,7 +72,7 @@ const loadSchema = z.object({
   pickup_city: optionalText(120), pickup_zip: optionalText(10), pickup_date: z.string().date(),
   delivery_city: optionalText(120), delivery_zip: optionalText(10), delivery_date: z.preprocess((value) => value === "" ? null : value, z.string().date().nullable().optional()),
   rate: money, miles: z.number().int().nonnegative().max(20_000).nullable().optional(),
-  status: z.enum(["BOOKED", "DELIVERED", "CANCELLED"]).optional(), notes: optionalText(1000),
+  status: z.enum(["BOOKED", "PICKED_UP", "DELIVERED", "CANCELLED"]).optional(), notes: optionalText(1000),
 });
 const invoiceCreateSchema = z.object({ load_ids: z.array(uuid).min(1, "Choose at least one load").max(200) }).strict();
 const invoiceEditSchema = z.object({
@@ -684,7 +684,7 @@ export function registerDispatchRoutes(app: Express, deps: Deps) {
   app.get("/api/v1/dispatch/loads", ...guard, async (request: Req, response, next) => {
     try {
       const actor = request.actor!; const supabase = adminClient(); const scope = await teamScope(actor);
-      const query = z.object({ zip: z.string().trim().max(10).optional(), lane: z.string().trim().max(120).optional(), truck_id: uuid.optional(), dispatcher_id: uuid.optional(), from: z.string().date().optional(), to: z.string().date().optional(), status: z.enum(["BOOKED", "DELIVERED", "CANCELLED"]).optional() }).parse(request.query);
+      const query = z.object({ zip: z.string().trim().max(10).optional(), lane: z.string().trim().max(120).optional(), truck_id: uuid.optional(), dispatcher_id: uuid.optional(), from: z.string().date().optional(), to: z.string().date().optional(), status: z.enum(["BOOKED", "PICKED_UP", "DELIVERED", "CANCELLED"]).optional() }).parse(request.query);
       let loadQuery = supabase.from("dispatch_loads").select("*, dispatch_trucks(id, unit_number, truck_type, assigned_to, team_id, dispatch_department_id, dispatch_carriers(id, company_name, owner_id, team_id, department_id))").order("pickup_date", { ascending: false }).limit(1000);
       if (query.zip) loadQuery = loadQuery.or(`pickup_zip.ilike.${query.zip.replace(/[,()%]/g, "")}%,delivery_zip.ilike.${query.zip.replace(/[,()%]/g, "")}%`);
       if (query.lane) { const term = query.lane.replace(/[,()%]/g, ""); loadQuery = loadQuery.or(`pickup_city.ilike.%${term}%,delivery_city.ilike.%${term}%,broker_name.ilike.%${term}%,load_number.ilike.%${term}%`); }
