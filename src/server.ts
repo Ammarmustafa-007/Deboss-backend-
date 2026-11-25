@@ -362,6 +362,30 @@ async function validDepartmentPeople(departmentId: string, ids: string[]) {
 
 app.get("/health", (_request, response) => response.json({ status: "ok", service: "deboss-api", timestamp: new Date().toISOString() }));
 
+/** Due reminders for the signed-in author, across Brokerage and Dispatch Sales. */
+app.get("/api/v1/reminders/due", requireBrokerageUser, async (request: BrokerageRequest, response, next) => {
+  try {
+    const actor = request.actor!; const supabase = adminClient(); const now = new Date().toISOString();
+    const [leads, carriers] = await Promise.all([
+      supabase.from("lead_activities").select("id, lead_id, activity_type, body, due_at").eq("author_id", actor.id).is("completed_at", null).not("due_at", "is", null).lte("due_at", now).order("due_at").limit(20),
+      supabase.from("dispatch_activities").select("id, carrier_id, activity_type, body, due_at").eq("created_by", actor.id).is("completed_at", null).not("due_at", "is", null).lte("due_at", now).order("due_at").limit(20),
+    ]);
+    if (leads.error) throw leads.error; if (carriers.error) throw carriers.error;
+    const leadIds = [...new Set((leads.data ?? []).map((row) => row.lead_id))];
+    const carrierIds = [...new Set((carriers.data ?? []).map((row) => row.carrier_id))];
+    const [leadNames, carrierNames] = await Promise.all([
+      leadIds.length ? supabase.from("sales_leads").select("id, company_name").in("id", leadIds) : Promise.resolve({ data: [], error: null }),
+      carrierIds.length ? supabase.from("dispatch_carriers").select("id, company_name").in("id", carrierIds) : Promise.resolve({ data: [], error: null }),
+    ]);
+    if (leadNames.error) throw leadNames.error; if (carrierNames.error) throw carrierNames.error;
+    const names = new Map([...(leadNames.data ?? []), ...(carrierNames.data ?? [])].map((row) => [row.id, row.company_name]));
+    response.json({ reminders: [
+      ...(leads.data ?? []).map((row) => ({ ...row, kind: "lead", company_name: names.get(row.lead_id) ?? "Customer", href: `/app/sales/leads/${row.lead_id}` })),
+      ...(carriers.data ?? []).map((row) => ({ ...row, kind: "carrier", company_name: names.get(row.carrier_id) ?? "Carrier", href: `/app/dispatch/carriers/${row.carrier_id}?tab=activity` })),
+    ].sort((a, b) => String(a.due_at).localeCompare(String(b.due_at))) });
+  } catch (error) { next(error); }
+});
+
 /** Super Admin: the Brokerage Sales Manager switch. Turning it off moves loads waiting for the Sales Manager on. */
 app.get("/api/v1/admin/brokerage-settings", requireSuperAdmin, async (_request, response, next) => {
   try { response.json({ sales_manager_approval: await salesManagerApproval(adminClient()) }); } catch (error) { next(error); }
@@ -1291,6 +1315,16 @@ app.patch("/api/v1/brokerage/shipments/:id", requireBrokerageUser, async (reques
       if (input.team_id !== undefined && (!input.team_id || !scope.leadTeamIds.includes(input.team_id))) return response.status(403).json({ error: "You can move shipments only between your own teams." });
     }
     if (input.status && ["QUOTED", "PAID"].includes(input.status)) return response.status(422).json({ error: "Use the Sales commercial lifecycle or invoice ledger for this status." });
+    let invoiceToPay: { id: string; status: string; amount: number; amount_paid: number } | null = null;
+    if (input.payment_status === "PAID") {
+      if (!["DELIVERED", "COMPLETED"].includes(shipment.status)) return response.status(422).json({ error: "Deliver the load before marking its invoice Paid." });
+      const { data: invoice, error: invoiceError } = await supabase.from("brokerage_invoices").select("id, status, amount, amount_paid").eq("shipment_id", shipment.id).maybeSingle();
+      if (invoiceError) throw invoiceError;
+      if (!invoice) return response.status(422).json({ error: "Generate the invoice before marking this load paid." });
+      if (invoice.status === "CANCELLED") return response.status(422).json({ error: "A cancelled invoice cannot be paid." });
+      if (Number(input.amount_paid ?? shipment.amount_paid ?? 0) < Number(invoice.amount)) return response.status(422).json({ error: "Enter the full invoice amount paid before marking it Paid." });
+      invoiceToPay = invoice;
+    }
     const changesFinancials = input.amount_quoted !== undefined || input.amount_invoiced !== undefined || input.amount_paid !== undefined || input.payment_status !== undefined || input.pickup_date !== undefined || input.delivery_date !== undefined;
     if ((input.status || input.carrier_name !== undefined || input.note) && !canUpdate) return response.status(403).json({ error: "Shipment update permission is required." });
     if (changesFinancials && !canRecordFinance) return response.status(403).json({ error: "Shipment finance update permission is required." });
@@ -1353,6 +1387,15 @@ app.patch("/api/v1/brokerage/shipments/:id", requireBrokerageUser, async (reques
     if (input.status && ["DELIVERED", "COMPLETED"].includes(input.status) && shipment.operations_department_id) {
       const { created, invoice } = await ensureInvoice(supabase, data, actor.id, {}, true);
       if (created) await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "INVOICE_GENERATED", body: invoice.invoice_number });
+    }
+    if (invoiceToPay) {
+      if (invoiceToPay.status !== "PAID") {
+        const { error: paidError } = await supabase.from("brokerage_invoices").update({ status: "PAID", amount_paid: Number(input.amount_paid ?? shipment.amount_paid), paid_at: new Date().toISOString() }).eq("id", invoiceToPay.id);
+        if (paidError) throw paidError;
+      }
+      const { error: completedError } = await supabase.from("brokerage_shipments").update({ status: "COMPLETED", sales_status: "PAID" }).eq("id", shipment.id);
+      if (completedError) throw completedError;
+      if (shipment.status !== "COMPLETED") await supabase.from("shipment_events").insert({ shipment_id: shipment.id, actor_id: actor.id, event_type: "STATUS_CHANGED", from_status: shipment.status, to_status: "COMPLETED", body: "Completed when the invoice was paid." });
     }
     // The invoice is due 15 days after delivery, so a changed delivery date moves the due date of an unpaid invoice.
     if (data.delivery_date && data.delivery_date !== shipment.delivery_date) await supabase.from("brokerage_invoices").update({ due_date: invoiceDueDate(data.delivery_date) }).eq("shipment_id", shipment.id).not("status", "in", "(PAID,CANCELLED)");
