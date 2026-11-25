@@ -1807,6 +1807,24 @@ app.use((error: unknown, _request: Request, response: Response, _next: NextFunct
 app.listen(port, () => console.log(`DEBOSS API listening on port ${port}`));
 
 // Overdue invoices are flagged hourly even when nobody opens the invoice list (IN-4).
-const overdueSweep = () => { if (!supabaseUrl || !serviceRoleKey) return; markOverdueInvoices(adminClient()).then((count) => { if (count) console.log(`Marked ${count} invoice(s) overdue.`); }).catch((error) => console.error("Overdue invoice check failed", error)); };
+async function reconcilePreviouslyPaidInvoices(supabase: ReturnType<typeof adminClient>) {
+  const { data: paidShipments, error } = await supabase.from("brokerage_shipments").select("id, status, amount_paid, updated_at").eq("payment_status", "PAID").limit(1000);
+  if (error) throw error;
+  if (!paidShipments?.length) return;
+  const { data: invoices, error: invoiceError } = await supabase.from("brokerage_invoices").select("id, shipment_id, amount, status").in("shipment_id", paidShipments.map((row) => row.id)).in("status", ["DRAFT", "SENT", "PENDING", "OVERDUE"]);
+  if (invoiceError) throw invoiceError;
+  const shipmentById = new Map(paidShipments.map((row) => [row.id, row]));
+  for (const invoice of invoices ?? []) {
+    const shipment = shipmentById.get(invoice.shipment_id);
+    if (!shipment || Number(shipment.amount_paid ?? 0) < Number(invoice.amount ?? 0)) continue;
+    const { error: paidError } = await supabase.from("brokerage_invoices").update({ status: "PAID", amount_paid: shipment.amount_paid, paid_at: shipment.updated_at ?? new Date().toISOString() }).eq("id", invoice.id);
+    if (paidError) throw paidError;
+    if (shipment.status === "DELIVERED") {
+      const { error: completedError } = await supabase.from("brokerage_shipments").update({ status: "COMPLETED", sales_status: "PAID" }).eq("id", shipment.id);
+      if (completedError) throw completedError;
+    }
+  }
+}
+const overdueSweep = () => { if (!supabaseUrl || !serviceRoleKey) return; const supabase = adminClient(); reconcilePreviouslyPaidInvoices(supabase).then(() => markOverdueInvoices(supabase)).then((count) => { if (count) console.log(`Marked ${count} invoice(s) overdue.`); }).catch((error) => console.error("Invoice status check failed", error)); };
 setTimeout(overdueSweep, 10_000);
 setInterval(overdueSweep, 60 * 60 * 1000);
